@@ -209,9 +209,10 @@ struct VolumeScene {
   // Look of the native row above (btnMCX), so the Bluetooth row matches it.
   WCHAR row_visual[64];
   float row_point_size;
-  // The gap between the native rows, relative to the panel: the Bluetooth
-  // row fills all of it so its edge lines up with the row below.
+  // The gap between the native rows: gap_offset is where a 28-unit row
+  // touching the row below starts, relative to the panel.
   float gap_offset, gap_height;
+  DWORD tune_applied;
 };
 
 struct SettingsScene {
@@ -278,16 +279,28 @@ bool DacConnected() {
 // one Media row switches role. In Bluetooth mode the whole row is a single
 // "Bluetooth" button that opens the Bluetooth page, where the volume and the
 // devices live; the USB Audio buttons and label are hidden.
+// Live tuning for the Bluetooth row's placement, poked over XBDM while the
+// Guide is open: [0] 'UAGT', [1] y offset and [2] height in 1/100 units
+// (0 = built-in default), [3] bumped to apply. Debug aid only.
+extern "C" volatile DWORD UsbGuideTune[4] = {0x55414754, 0, 0, 0};
+
 void SetRowMode(VolumeScene* state, bool bluetooth) {
   if (state->expanded) SetExpanded(state, false, XUSER_INDEX_FOCUS, false);
-  // Copy the native row's visual so the text is drawn in the same colour,
-  // and fill the whole gap so only one divider shows below the row.
+  // Copy the native row's visual so the text is drawn in the same colour.
+  // That visual is a fixed 28-unit row with its divider at the bottom, so
+  // sit the row on the bottom of the gap: its divider then lands on Select
+  // Music's own top line and only one line shows.
   const bool fill = bluetooth && state->gap_height >= 28.0f;
-  D3DXVECTOR3 position(bluetooth ? 0.0f : 161.0f, fill ? state->gap_offset : 0.0f, 0);
+  float row_y = fill ? state->gap_offset : 0.0f, row_height = 28.0f;
+  if (bluetooth && UsbGuideTune[2]) {
+    row_y = (float)(LONG)UsbGuideTune[1] / 100.0f;
+    row_height = (float)(LONG)UsbGuideTune[2] / 100.0f;
+  }
+  D3DXVECTOR3 position(bluetooth ? 0.0f : 161.0f, row_y, 0);
   LPCWSTR visual = state->row_visual[0] ? state->row_visual : L"XuiButtonGuide";
   bool ok = g_xui.set_position(state->volume_button, &position) >= 0 &&
       SetFloat(state->volume_button, L"Width", bluetooth ? 323.0f : 52.0f) &&
-      SetFloat(state->volume_button, L"Height", fill ? state->gap_height : 28.0f) &&
+      SetFloat(state->volume_button, L"Height", bluetooth ? row_height : 28.0f) &&
       SetString(state->volume_button, L"Visual",
                 bluetooth ? visual : L"xuiButtonImageCenteredMusic") &&
       SetString(state->volume_button, L"ImagePath", bluetooth ? L"" : g_volume_icon) &&
@@ -317,7 +330,11 @@ void RefreshRowVisibility(VolumeScene* state) {
   // With Bluetooth built in, the row is always there when no DAC is in use,
   // so the page can say what to connect.
   const bool bluetooth = !info.connected && USB_AUDIO360_BLUETOOTH;
-  if (bluetooth != state->bluetooth) SetRowMode(state, bluetooth);
+  if (bluetooth != state->bluetooth || (bluetooth && UsbGuideTune[3] != state->tune_applied)) {
+    state->tune_applied = UsbGuideTune[3];
+    SetRowMode(state, bluetooth);
+    state->row_text[0] = 0;  // Re-apply the label below.
+  }
   if (state->bluetooth) {
     // "Bluetooth - <device>" while a device is connected.
     WCHAR text[96] = L"Bluetooth";
@@ -1680,14 +1697,15 @@ bool InjectMedia(HXUIOBJ scene) {
     const float gap_top = above_rect.y + above_rect.height;
     const float gap = next_rect.y - gap_top;
     if (gap >= 28 && gap <= 40) {
-      state->gap_offset = gap_top - insertion_y;
+      state->gap_offset = next_rect.y - 28 - insertion_y;
       state->gap_height = gap;
     }
     char line[160];
     _snprintf_s(line, sizeof(line), _TRUNCATE,
-                "guide row visual=%ls point=%d gap=%d offset=%d",
+                "guide row visual=%ls point=%d gap_top=%d gap=%d panel_y=%d offset=%d (x100)",
                 state->row_visual[0] ? state->row_visual : L"?",
-                (int)state->row_point_size, (int)gap, (int)state->gap_offset);
+                (int)state->row_point_size, (int)(gap_top * 100), (int)(gap * 100),
+                (int)(insertion_y * 100), (int)(state->gap_offset * 100));
     DiagnosticsText(line);
   }
   state->above_button = above;
