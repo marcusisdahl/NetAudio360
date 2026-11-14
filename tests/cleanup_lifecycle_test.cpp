@@ -25,7 +25,12 @@ int main() {
 
   assert(cleanup.Begin(0));  // Setup failure before any endpoint opened.
   assert(cleanup.Ready(0) && cleanup.Finalize(0) && cleanup.Rearm());
-  assert(!cleanup.Begin(4));
+  // Bluetooth: three data endpoints plus the default endpoint.
+  assert(cleanup.Begin(4) && cleanup.pending() == 4);
+  assert(cleanup.Complete(3) && cleanup.Complete(0) && cleanup.Complete(1));
+  assert(!cleanup.Ready(0) && cleanup.Complete(2) && !cleanup.Complete(4));
+  assert(cleanup.Finalize(0) && cleanup.Rearm());
+  assert(!cleanup.Begin(5));
   puts("Asynchronous cleanup lifecycle tests passed");
   return 0;
 }
