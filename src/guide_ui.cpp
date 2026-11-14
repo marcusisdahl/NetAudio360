@@ -254,6 +254,7 @@ struct BluetoothScene {
   bool focus_pending;
 };
 bool OpenBluetooth(VolumeScene* state, BYTE user);
+void Utf8ToWide(const char* in, WCHAR* out, size_t capacity);
 
 bool SetExpanded(VolumeScene* state, bool expanded, BYTE user, bool restore_focus = true);
 bool OpenSettings(VolumeScene* state, BYTE user);
