@@ -466,6 +466,9 @@ static SHORT g_tone[128];
 static DWORD g_audio_ui = kBluetoothAudioNone;
 static DWORD g_audio_failure = 0;
 static DWORD g_audio_detail = 0;
+const unsigned kTraceFrames = 48;
+static unsigned g_trace_count = 0;
+static unsigned g_a2dp_unhandled_logged = 0;
 
 void StreamBegin() {
   g_stream_start = GetTickCount();
@@ -530,6 +533,8 @@ void A2dpResetStream() {
   g_audio_ui = kBluetoothAudioNone;
   g_audio_failure = g_audio_detail = 0;
   UsbBtA2dp[kA2State] = 0;
+  g_trace_count = 0;
+  g_a2dp_unhandled_logged = 0;
 }
 
 LONG __cdecl AclInComplete(DWORD transfer, LONG status) {
@@ -643,6 +648,21 @@ void OnCompletedPackets(const BYTE* p, unsigned n) {
   if (g_acl_credits > g_scanner.acl_buffers()) g_acl_credits = g_scanner.acl_buffers();
 }
 
+// Setup trace: the first frames of each connection, both directions, so a
+// stalled AVDTP setup shows what the headphones sent. Payload bytes only
+// (L2CAP signalling and AVDTP; link keys never travel over ACL).
+
+void TraceFrame(const char* direction, const BYTE* frame, unsigned length) {
+  if (g_trace_count >= kTraceFrames || g_a2dp.streaming()) return;
+  ++g_trace_count;
+  char hex[3 * 24 + 1];
+  unsigned shown = length < 24 ? length : 24;
+  for (unsigned i = 0; i < shown; ++i)
+    _snprintf(hex + 3 * i, 4, "%02x ", frame[i]);
+  hex[3 * shown] = 0;
+  Log("bt-l2 %s len=%u %s%s", direction, length, hex, shown < length ? "..." : "");
+}
+
 void AclDrain(DWORD now) {
   for (;;) {
     unsigned n = g_acl_bytes.Read(g_acl_drain, sizeof(g_acl_drain));
@@ -653,8 +673,19 @@ void AclDrain(DWORD now) {
       used += g_acl_assembler.Push(g_acl_drain + used, n - used, &complete);
       if (!complete) continue;
       ++UsbBtA2dp[kA2FramesIn];
-      if (g_link.busy() && g_acl_assembler.handle() == g_link.handle())
+      TraceFrame("in ", g_acl_assembler.frame(), g_acl_assembler.frame_length());
+      if (g_link.busy() && g_acl_assembler.handle() == g_link.handle()) {
         g_a2dp.OnFrame(g_acl_assembler.frame(), g_acl_assembler.frame_length(), now);
+      } else {
+        Log("bt-l2 dropped handle=0x%03x link=0x%03x busy=%u",
+            (unsigned)g_acl_assembler.handle(), (unsigned)g_link.handle(),
+            g_link.busy() ? 1u : 0u);
+      }
+      if (g_a2dp.unhandled() != g_a2dp_unhandled_logged) {
+        g_a2dp_unhandled_logged = g_a2dp.unhandled();
+        Log("bt-a2dp unhandled=%u state=%s", g_a2dp_unhandled_logged,
+            bt::A2dpStateName(g_a2dp.state()));
+      }
     }
   }
 }
@@ -666,6 +697,7 @@ void AclTransmit() {
       unsigned n = 0;
       const BYTE* frame = g_a2dp.Output(&n);
       if (n <= sizeof(g_tx_frame)) {
+        TraceFrame("out", frame, n);
         memcpy(g_tx_frame, frame, n);
         g_tx_length = n;
         g_tx_offset = 0;
@@ -954,8 +986,13 @@ void DrainEvents(DWORD now) {
       // link layer owns the controller.
       if (!g_scanner.finished())
         g_scanner.OnEvent(g_assembler.buffer(), g_assembler.length(), now);
-      else
+      else {
+        unsigned before = g_link.unhandled_events();
         g_link.OnEvent(g_assembler.buffer(), g_assembler.length(), now);
+        if (g_link.unhandled_events() != before)
+          Log("bt-link unhandled event=0x%02x len=%u",
+              (unsigned)g_assembler.buffer()[0], g_assembler.length());
+      }
     }
   }
 }
