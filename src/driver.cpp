@@ -621,6 +621,27 @@ static void RecordDevice(DeviceHandle* handle, int status,
   DiagnosticsObserveDevice(observation);
 }
 
+// A device-class (type-2) node keeps its default endpoint through the
+// kernel's add completion only if node+4 names a class-driver descriptor;
+// otherwise the completion closes it and export 746 returns endpoint 0. The
+// kernel uses node+4 only for that test and, on unplug, to call +0x10
+// RemoveDevice(node) (and +0x18 if non-zero) instead of export 751. Layout
+// matches the kernel's static descriptors on 17559 (docs/bluetooth-stage1.md).
+static LONG BluetoothNodeRemove(DeviceHandle* node);
+static void BluetoothNodeAddUnused(DeviceHandle*) {}
+static DWORD g_bluetooth_class_driver[8] = {
+    0, 0, 0x000000E0,
+    (DWORD)BluetoothNodeAddUnused, (DWORD)BluetoothNodeRemove,
+    0, 0 /* +0x18 notify: must stay 0 */, 0};
+
+static LONG BluetoothNodeRemove(DeviceHandle* node) {
+  // The add path writes node+4 only when it finds a driver, so clear it
+  // before the node can be reused. Then do what the kernel does for a
+  // driverless node: export 751, which reaches RemoveDeviceCompleteHook.
+  ((DWORD*)node)[1] = 0;
+  return g_remove_device_complete(node);
+}
+
 static int AddDeviceCompleteHook(DeviceHandle* handle, int status) {
   // The first compatible playback interface owns the only plugin slot. A
   // secondary DAC/interface is left entirely to the kernel's normal path.
@@ -669,6 +690,9 @@ static int AddDeviceCompleteHook(DeviceHandle* handle, int status) {
     handle->driver = &g_extension;
     InterlockedExchange((volatile LONG*)&g_bluetooth_handle, (LONG)handle);
     BluetoothDeviceAttached(handle);
+    DWORD* node = (DWORD*)handle;
+    if (!node[1] && (((BYTE*)handle)[0xB] & 7) != 5)
+      node[1] = (DWORD)g_bluetooth_class_driver;  // Keep the default endpoint.
     // Same completion contract as the audio claim below.
     int result = g_add_detour.Original<AddDeviceCompleteFn>()(handle, 0);
     BluetoothRecordAddComplete(handle);

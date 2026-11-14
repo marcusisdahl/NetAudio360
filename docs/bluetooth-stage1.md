@@ -162,6 +162,16 @@ reads a snapshot (`BluetoothGetUiState`) and never touches USB.
   when the endpoint is 0. The transport also refuses any TRB with a NULL
   endpoint.
 
+- Probe result: the adapter arrives as a type-2 device node (`+B=0x12`) with
+  node+4 = 0, so add-complete zeroed default slot 4 and 746 returned 0. The
+  probe build stopped with `0xb00b` and COD stayed up.
+- Node+4 is the kernel's class-driver descriptor pointer (static data, layout
+  `+8` class word, `+0xC` AddDevice, `+0x10` RemoveDevice, `+0x18` optional
+  notify). The kernel only tests it for non-zero in 740 and, on unplug, calls
+  `+0x10(node)` instead of export 751. Fix: the Bluetooth claim sets node+4
+  to a plugin-owned descriptor before the original 740; its RemoveDevice
+  clears node+4 and calls export 751, which reaches the existing remove hook.
+
 ## Next
 
 Stage 2 adds Secure Simple Pairing, link keys in the ini, and connect/forget.
