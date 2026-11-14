@@ -2,6 +2,8 @@
 
 Status: implemented, awaiting hardware validation on COD.
 
+![Guide → Media → Bluetooth on COD after pairing: Bose NC 700 under Paired devices, connected](img/guide-bluetooth-paired.png)
+
 ## What it does
 
 - Setup now also sends Write_Simple_Pairing_Mode(1) and Write_Local_Name
