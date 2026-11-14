@@ -121,6 +121,12 @@ void RunSetup(Scanner& s, Recorder& r, unsigned* now, bool inquire = true) {
   CommandComplete(s, kOpReadBdAddr, addr_ret, 7, ++*now);
   assert(r.addresses == 1 && !memcmp(s.local_address(), kLocal, 6));
 
+  const u8 bufsize[] = {0x05, 0x10, 0x00};
+  ExpectCommand(s, bufsize, 3, *now);
+  const u8 bufsize_ret[] = {0, 0x36, 0x01, 0x40, 0x0A, 0x00, 0x08, 0x00};
+  CommandComplete(s, kOpReadBufferSize, bufsize_ret, 8, ++*now);
+  assert(s.acl_mtu() == 310 && s.acl_buffers() == 10);
+
   const u8 mask[] = {0x01, 0x0C, 0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xDF, 0xBF, 0x1C};
   ExpectCommand(s, mask, sizeof(mask), *now);
   CommandComplete(s, kOpSetEventMask, ok, 1, ++*now);
@@ -391,6 +397,10 @@ void TestInquiryModeFallbackAndFailures() {
   s.NextCommand(out, sizeof(out)); s.CommandSent(now);
   u8 addr_ret[7] = {0};
   CommandComplete(s, kOpReadBdAddr, addr_ret, 7, ++now);
+  // Read_Buffer_Size rejected: a warning; defaults stay.
+  s.NextCommand(out, sizeof(out)); s.CommandSent(now);
+  CommandComplete(s, kOpReadBufferSize, unknown, 1, ++now);
+  assert(r.warnings == 2 && s.acl_mtu() == 27 && s.acl_buffers() == 1);
   s.NextCommand(out, sizeof(out)); s.CommandSent(now);
   CommandComplete(s, kOpSetEventMask, ok, 1, ++now);
 
@@ -401,10 +411,10 @@ void TestInquiryModeFallbackAndFailures() {
   const u8 mode1[] = {0x45, 0x0C, 0x01, 0x01};
   ExpectCommand(s, mode1, 4, now);
   CommandComplete(s, kOpWriteInquiryMode, unknown, 1, ++now);
-  assert(s.stage() == kStageSimplePairing && r.warnings == 3);
+  assert(s.stage() == kStageSimplePairing && r.warnings == 4);
   // SSP and local name failures are warnings too.
   SetupTail(s, &now, 0x01, 0x01);
-  assert(s.stage() == kStageInquiry && r.warnings == 5);
+  assert(s.stage() == kStageInquiry && r.warnings == 6);
 
   s.NextCommand(out, sizeof(out)); s.CommandSent(now);
   CommandStatus(s, kOpInquiry, 0, ++now);

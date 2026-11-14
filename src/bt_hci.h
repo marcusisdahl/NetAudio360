@@ -48,7 +48,8 @@ enum Opcode {
   kOpWriteLocalName = 0x0C13,
   kOpWriteSimplePairingMode = 0x0C56,
   kOpReadLocalVersion = 0x1001,
-  kOpReadBdAddr = 0x1009
+  kOpReadBdAddr = 0x1009,
+  kOpReadBufferSize = 0x1005
 };
 
 enum EventCode {
@@ -177,6 +178,7 @@ enum Stage {
   kStageReset,
   kStageReadVersion,
   kStageReadAddress,
+  kStageBufferSize,     // Read_Buffer_Size: ACL packet size and count.
   kStageEventMask,
   kStageInquiryMode,
   kStageSimplePairing,  // Write_Simple_Pairing_Mode(1); warning on failure.
@@ -247,6 +249,9 @@ class Scanner {
   unsigned inquiries() const { return inquiries_; }
   bool finished() const { return stage_ == kStageDone || stage_ == kStageFailed; }
   const u8* local_address() const { return local_address_; }
+  // Controller ACL buffers (Read_Buffer_Size); defaults if not reported.
+  unsigned acl_mtu() const { return acl_mtu_; }
+  unsigned acl_buffers() const { return acl_buffers_; }
   const Device* devices() const { return devices_; }
   unsigned device_count() const { return device_count_; }
   unsigned unhandled_events() const { return unhandled_events_; }
@@ -276,6 +281,7 @@ class Scanner {
   int name_index_;       // Device awaiting Remote Name Request Complete.
   bool name_wait_;
   u8 local_address_[6];
+  unsigned acl_mtu_, acl_buffers_;
   Device devices_[kMaxDevices];
   unsigned device_count_;
   unsigned unhandled_events_;

@@ -172,7 +172,8 @@ void FormatAddress(const u8* a, char* out) {
 
 const char* StageName(unsigned stage) {
   static const char* names[] = {
-    "idle", "reset", "read-version", "read-address", "event-mask",
+    "idle", "reset", "read-version", "read-address", "buffer-size",
+    "event-mask",
     "inquiry-mode", "simple-pairing", "local-name", "inquiry", "names",
     "done", "failed"
   };
@@ -203,6 +204,8 @@ Scanner::Scanner(ScanObserver* observer) : observer_(observer) {
   name_index_ = -1;
   name_wait_ = false;
   memset(local_address_, 0, sizeof(local_address_));
+  acl_mtu_ = 27;      // Smallest an ACL-U controller may report.
+  acl_buffers_ = 1;
   memset(devices_, 0, sizeof(devices_));
   device_count_ = 0;
   unhandled_events_ = 0;
@@ -259,6 +262,7 @@ unsigned Scanner::NextCommand(u8* out, unsigned capacity) {
     case kStageReset: opcode = kOpReset; break;
     case kStageReadVersion: opcode = kOpReadLocalVersion; break;
     case kStageReadAddress: opcode = kOpReadBdAddr; break;
+    case kStageBufferSize: opcode = kOpReadBufferSize; break;
     case kStageEventMask:
       opcode = kOpSetEventMask;
       memcpy(params, kEventMask, 8);
@@ -393,6 +397,16 @@ bool Scanner::OnCommandComplete(const u8* p, unsigned n, unsigned now) {
       }
       memcpy(local_address_, r + 1, 6);
       if (observer_) observer_->OnLocalAddress(local_address_);
+      Advance(kStageBufferSize, now);
+      break;
+    case kStageBufferSize:
+      if (!status && rn >= 8) {
+        unsigned mtu = Le16(r + 1), count = Le16(r + 4);
+        if (mtu >= 27) acl_mtu_ = mtu;
+        if (count) acl_buffers_ = count;
+      } else if (observer_) {
+        observer_->OnWarning(stage_, opcode, status);
+      }
       Advance(kStageEventMask, now);
       break;
     case kStageEventMask:
