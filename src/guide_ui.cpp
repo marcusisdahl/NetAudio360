@@ -314,7 +314,15 @@ void RefreshRowVisibility(VolumeScene* state) {
           continue;
         WCHAR name[64];
         Utf8ToWide(ui.paired[i].name, name, _countof(name));
-        _snwprintf_s(text, _countof(text), _TRUNCATE, L"Bluetooth - %.40s", name);
+        // The row fits about 31 characters, so keep the name to 20 and cut at
+        // a word boundary ("Bose NC 700 Headphones" -> "Bose NC 700").
+        const size_t kMaxName = 20;
+        if (wcslen(name) > kMaxName) {
+          size_t cut = kMaxName;
+          while (cut > 0 && name[cut] != L' ') --cut;
+          name[cut ? cut : kMaxName] = 0;
+        }
+        _snwprintf_s(text, _countof(text), _TRUNCATE, L"Bluetooth - %s", name);
       }
     }
     if (wcscmp(text, state->row_text) != 0 &&

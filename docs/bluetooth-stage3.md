@@ -3,6 +3,13 @@
 Once a paired device is connected (authenticated and encrypted), the plugin
 opens the A2DP stream and plays console audio over it.
 
+![Guide → Media on COD: the single Bluetooth row while the Bose NC 700 is connected](img/bt-guide-media-row.png)
+
+![The Bluetooth page while streaming: paired Bose NC 700, volume slider, "Playing console audio over Bluetooth."](img/bt-page-volume.png)
+
+The volume slider sets the plugin's own level. Swiping on the headphones
+changes their absolute volume (AVRCP) and does not move the slider.
+
 ## Data path
 
 - `ConfigTick` opens the adapter's bulk IN and bulk OUT endpoints right after
