@@ -112,6 +112,8 @@ Use a build without other changes. Check the DashLaunch plugin slot and the
 
 ## Guide page (stage 1b)
 
+![Guide → Media → Bluetooth on COD: CSR adapter, Bose NC 700 found by Pair new device](img/guide-bluetooth.png)
+
 While the adapter holds the device slot, the Media tab's USB Audio row turns
 into a **Bluetooth** row. Its first button opens Guide → Media → Bluetooth,
 which shows:
