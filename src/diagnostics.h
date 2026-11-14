@@ -11,6 +11,7 @@ enum UsbAudioDeviceDecision {
   kDeviceSlotBusy = 2,
   kDeviceTransportRejected = 3,
   kDeviceClaimed = 4,
+  kDeviceKernelClaimed = 5,
 };
 
 struct UsbAudioDeviceObservation {
@@ -30,6 +31,7 @@ struct UsbAudioDeviceObservation {
   BYTE endpoint_count;
   BYTE controller;
   BYTE rejection;
+  BYTE controller_flags;  // HCD byte +0x96 (bit 1: full-speed OHCI path).
   LONG add_status;
   UsbAudioDeviceDecision decision;
 };
@@ -47,5 +49,8 @@ void DiagnosticsFailure(DWORD error, DWORD stage, DWORD request,
                         const uac::Format& format);
 void DiagnosticsStreaming();
 void DiagnosticsDisconnected();
+// Passive threads only: queues one preformatted line (written as
+// "event=bluetooth <text>"). Returns false when the queue is full.
+bool DiagnosticsText(const char* text);
 void DiagnosticsTick();
 bool DiagnosticsSettingsPath(char* output, DWORD capacity);

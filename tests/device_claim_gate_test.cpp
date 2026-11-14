@@ -38,6 +38,20 @@ int main() {
   assert(gate.Activate(&second));
   assert(gate.active(&second));
 
+  // The single slot records which class owns it so removal is routed to the
+  // matching driver, and the kind is cleared with the claim.
+  assert(gate.kind() == usb_transport::DeviceClaimGate::kAudio);
+  assert(gate.BeginRemoval(&second));
+  assert(gate.kind() == usb_transport::DeviceClaimGate::kAudio);
+  assert(gate.CompleteRemoval());
+  assert(gate.kind() == usb_transport::DeviceClaimGate::kNone);
+  assert(!gate.Activate(&first, usb_transport::DeviceClaimGate::kNone));
+  assert(gate.Activate(&first, usb_transport::DeviceClaimGate::kBluetooth));
+  assert(gate.kind() == usb_transport::DeviceClaimGate::kBluetooth);
+  assert(!gate.Activate(&second, usb_transport::DeviceClaimGate::kAudio));
+  assert(gate.CancelActivation(&first));
+  assert(gate.kind() == usb_transport::DeviceClaimGate::kNone);
+
   puts("Single-device claim gate tests passed");
   return 0;
 }

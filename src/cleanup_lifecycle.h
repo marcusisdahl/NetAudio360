@@ -6,11 +6,14 @@ namespace usb_transport {
 
 class CleanupLifecycle {
  public:
+  // Three data endpoints (HCI event, ACL in, ACL out) plus the default one.
+  static const unsigned kMaxRequests = 4;
+
   CleanupLifecycle() : expected_(0), completed_(0), begun_(false),
                        finalized_(false) {}
 
   bool Begin(unsigned request_count) {
-    if (begun_ || request_count > 3) return false;
+    if (begun_ || request_count > kMaxRequests) return false;
     expected_ = request_count ? ((1u << request_count) - 1) : 0;
     completed_ = 0;
     begun_ = true;
@@ -19,7 +22,7 @@ class CleanupLifecycle {
   }
 
   bool Complete(unsigned index) {
-    if (index >= 3) return false;
+    if (index >= kMaxRequests) return false;
     const unsigned bit = 1u << index;
     if (!begun_ || !(expected_ & bit) || (completed_ & bit))
       return false;

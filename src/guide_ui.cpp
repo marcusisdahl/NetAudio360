@@ -6,7 +6,9 @@
 #include <wchar.h>
 #include <math.h>
 #include "audio.h"
+#include "bluetooth.h"
 #include "detour.h"
+#include "diagnostics.h"
 #include "guide_icons.h"
 #include "guide_layout.h"
 
@@ -22,6 +24,8 @@ static XUIClass g_volume_class;
 static HXUICLASS g_volume_class_handle = 0;
 static XUIClass g_settings_class;
 static HXUICLASS g_settings_class_handle = 0;
+static XUIClass g_bluetooth_class;
+static HXUICLASS g_bluetooth_class_handle = 0;
 static bool g_register_attempted = false;
 static HXUIOBJ g_guide_main_scene = 0;
 static WCHAR g_volume_icon[128];
@@ -200,6 +204,18 @@ struct VolumeScene {
   bool layout_ready, visible;
   bool expanded;
   bool synchronizing;
+  bool bluetooth;  // Row shows the Bluetooth adapter instead of a DAC.
+  WCHAR row_text[96];  // Bluetooth row label as last set.
+  // Look of the native row above (btnMCX), so the Bluetooth row matches it.
+  WCHAR row_visual[64];
+  float row_point_size;
+  // Placement of the Bluetooth row in the gap, relative to the panel.
+  float gap_offset, gap_height, row_height;
+  DWORD tune_applied;
+  bool label_logged, label_base_known;
+  float label_base_x, label_base_y;
+  float cell_top;  // Top of the gap relative to the panel.
+  float green_y, green_height;  // Focus fill, relative to the button.
 };
 
 struct SettingsScene {
@@ -224,6 +240,32 @@ struct SettingsScene {
 };
 const DWORD kSettingsRefreshTimer = 0x55534253;
 const DWORD kVolumeRefreshTimer = 0x55534256;
+const DWORD kBluetoothRefreshTimer = 0x55534254;
+const unsigned kBluetoothButtons = 6;
+const unsigned kBluetoothPairedButtons = 3;
+
+struct BluetoothScene {
+  HXUIOBJ object;
+  HXUIOBJ back_button, adapter_text, status_text, scan_button;
+  HXUIOBJ forget_button, paired_text;
+  HXUIOBJ volume_text, volume_slider;
+  bool synchronizing;
+  LONG shown_volume;
+  HXUIOBJ devices[kBluetoothButtons];
+  HXUIOBJ paired[kBluetoothPairedButtons];
+  BluetoothUiState ui;
+  bool have_state;
+  bool have_seen_results;
+  unsigned shown;
+  unsigned paired_shown;
+  DWORD seen_results;  // link_result_count already turned into a notice.
+  WCHAR notice[160];
+  DWORD notice_until;
+  BYTE user;
+  bool focus_pending;
+};
+bool OpenBluetooth(VolumeScene* state, BYTE user);
+void Utf8ToWide(const char* in, WCHAR* out, size_t capacity);
 
 bool SetExpanded(VolumeScene* state, bool expanded, BYTE user, bool restore_focus = true);
 bool OpenSettings(VolumeScene* state, BYTE user);
@@ -236,11 +278,164 @@ bool DacConnected() {
   return AudioGetDeviceInfo(&info) && info.connected;
 }
 
+// The single device slot holds either a DAC or a Bluetooth adapter, so the
+// one Media row switches role. In Bluetooth mode the whole row is a single
+// "Bluetooth" button that opens the Bluetooth page, where the volume and the
+// devices live; the USB Audio buttons and label are hidden.
+// Live tuning for the Bluetooth row's placement, poked over XBDM while the
+// Guide is open: [0] 'UAGT', [1] y offset and [2] height in 1/100 units
+// (0 = built-in default), [3] bumped to apply, [4] vertical scale in 1/1000
+// (0 = none), [5]/[6] label y/x offset in 1/100 units (signed, 0 = none).
+// Debug aid only.
+extern "C" volatile DWORD UsbGuideTune[7] = {0x55414754, 0, 0, 0, 0, 0, 0};
+
+// Moves the text elements of the button's visual by dx/dy from where the
+// skin put them, and stretches GreenHighlight (the focus fill, 25 units in
+// the skin) over the whole cell when green_height is set. Logs the visual's
+// children once. Re-applied from the refresh timer, since focus changes
+// replay the visual's timeline.
+void NudgeRowLabel(VolumeScene* state, float dx, float dy) {
+  HXUIOBJ visual = 0;
+  if (g_xui.visual(state->volume_button, &visual) < 0 || !visual) return;
+  HXUIOBJ child = 0;
+  if (g_xui.first(visual, &child) < 0) return;
+  for (unsigned i = 0; child && i < 16; ++i) {
+    LPCWSTR id = 0;
+    D3DXVECTOR3 position;
+    if (g_xui.id(child, &id) >= 0 && g_xui.position(child, &position) >= 0) {
+      PropertyValue height;
+      const float h = GetProperty(child, L"Height", &height) &&
+          height.get()->type == XUI_EPT_FLOAT ? height.get()->fVal : -1;
+      if (!state->label_logged) {
+        char line[160];
+        _snprintf_s(line, sizeof(line), _TRUNCATE,
+                    "guide row visual child %u id=%ls y=%d h=%d (x100)", i,
+                    id ? id : L"?", (int)(position.y * 100), (int)(h * 100));
+        DiagnosticsText(line);
+      }
+      if (id && state->green_height > 0 && wcscmp(id, L"GreenHighlight") == 0) {
+        if (position.y != state->green_y || h != state->green_height) {
+          position.y = state->green_y;
+          g_xui.set_position(child, &position);
+          SetFloat(child, L"Height", state->green_height);
+        }
+      } else if (id && _wcsnicmp(id, L"text", 4) == 0) {
+        if (!state->label_base_known) {
+          state->label_base_x = position.x;
+          state->label_base_y = position.y;
+          state->label_base_known = true;
+        }
+        const float want_x = state->label_base_x + dx;
+        const float want = state->label_base_y + dy;
+        if (position.y != want || position.x != want_x) {
+          position.x = want_x;
+          position.y = want;
+          g_xui.set_position(child, &position);
+        }
+      }
+    }
+    HXUIOBJ next = 0;
+    if (g_xui.next(child, &next) < 0) break;
+    child = next;
+  }
+  state->label_logged = true;
+}
+
+void SetRowMode(VolumeScene* state, bool bluetooth) {
+  if (state->expanded) SetExpanded(state, false, XUSER_INDEX_FOCUS, false);
+  // Copy the native row's visual so the text is drawn in the same colour.
+  // XuiButtonGuide does not stretch: measured on COD, its dividers sit at
+  // y + h - 28 and y + 28 (they move inward as the height grows). The
+  // geometry in InjectMedia puts them exactly on the native lines.
+  const bool fill = bluetooth && state->gap_height >= 28.0f;
+  float row_y = fill ? state->gap_offset : 0.0f;
+  float row_height = fill ? state->row_height : 28.0f;
+  if (bluetooth && UsbGuideTune[2]) {
+    row_y = (float)(LONG)UsbGuideTune[1] / 100.0f;
+    row_height = (float)(LONG)UsbGuideTune[2] / 100.0f;
+  }
+  D3DXVECTOR3 position(bluetooth ? 0.0f : 161.0f, row_y, 0);
+  LPCWSTR visual = state->row_visual[0] ? state->row_visual : L"XuiButtonGuide";
+  bool ok = g_xui.set_position(state->volume_button, &position) >= 0 &&
+      SetFloat(state->volume_button, L"Width", bluetooth ? 323.0f : 52.0f) &&
+      SetFloat(state->volume_button, L"Height", bluetooth ? row_height : 28.0f) &&
+      SetString(state->volume_button, L"Visual",
+                bluetooth ? visual : L"xuiButtonImageCenteredMusic") &&
+      SetString(state->volume_button, L"ImagePath", bluetooth ? L"" : g_volume_icon) &&
+      SetString(state->volume_button, L"Text", bluetooth ? L"Bluetooth" : L"") &&
+      SetBool(state->title, L"Show", !bluetooth) &&
+      SetBool(state->microphone_button, L"Show", !bluetooth) &&
+      SetBool(state->options_button, L"Show", !bluetooth) &&
+      SetString(state->volume_button, L"NavRight",
+                bluetooth ? L"" : L"MicrophoneMuteButton");
+  if (ok) {
+    D3DXVECTOR3 scale(1, 1, 1);
+    if (bluetooth && UsbGuideTune[4]) scale.y = (float)UsbGuideTune[4] / 1000.0f;
+    g_xui.set_scale(state->volume_button, &scale);
+    state->label_base_known = false;  // The skin rebuilds the visual.
+    // Fill the cell between the native lines when focused (not with scale).
+    state->green_height = fill && !UsbGuideTune[4] ? state->gap_height : 0;
+    state->green_y = state->cell_top - row_y;
+    if (bluetooth)
+      SetFloat(state->volume_button, L"PointSize",
+               state->row_point_size > 0 ? state->row_point_size : 12);
+    wcscpy_s(state->row_text, bluetooth ? L"Bluetooth" : L"");
+    // The visual changed: let the skin rebuild it.
+    XUIMessage message;
+    XuiMessage(&message, XM_SKIN_CHANGED);
+    g_xui.broadcast(state->volume_button, &message);
+    state->bluetooth = bluetooth;
+  }
+}
+
 void RefreshRowVisibility(VolumeScene* state) {
   if (!state || !state->layout_ready) return;
   AudioDeviceInfo info;
   if (!AudioGetDeviceInfo(&info)) return;
-  const bool visible = info.connected != FALSE;
+  // With Bluetooth built in, the row is always there when no DAC is in use,
+  // so the page can say what to connect.
+  const bool bluetooth = !info.connected && USB_AUDIO360_BLUETOOTH;
+  if (bluetooth != state->bluetooth || (bluetooth && UsbGuideTune[3] != state->tune_applied)) {
+    state->tune_applied = UsbGuideTune[3];
+    SetRowMode(state, bluetooth);
+    state->row_text[0] = 0;  // Re-apply the label below.
+  }
+  if (state->bluetooth) {
+    // Defaults tuned live on COD: the label sits 2.5 low and 1 right in the
+    // shortened visual.
+    const bool tuned = state->gap_height > 0;
+    const float dx = UsbGuideTune[6] ? (float)(LONG)UsbGuideTune[6] / 100.0f
+                                     : (tuned ? -1.0f : 0.0f);
+    const float dy = UsbGuideTune[5] ? (float)(LONG)UsbGuideTune[5] / 100.0f
+                                     : (tuned ? -2.5f : 0.0f);
+    NudgeRowLabel(state, dx, dy);
+  }
+  if (state->bluetooth) {
+    // "Bluetooth - <device>" while a device is connected.
+    WCHAR text[96] = L"Bluetooth";
+    BluetoothUiState ui;
+    if (BluetoothGetUiState(&ui) && ui.link == kBluetoothLinkConnected) {
+      for (unsigned i = 0; i < ui.paired_count && i < 3; ++i) {
+        if (memcmp(ui.paired[i].address, ui.link_address, 6) || !ui.paired[i].name[0])
+          continue;
+        WCHAR name[64];
+        Utf8ToWide(ui.paired[i].name, name, _countof(name));
+        // The row fits about 31 characters, so keep the name to 20 and cut at
+        // a word boundary ("Bose NC 700 Headphones" -> "Bose NC 700").
+        const size_t kMaxName = 20;
+        if (wcslen(name) > kMaxName) {
+          size_t cut = kMaxName;
+          while (cut > 0 && name[cut] != L' ') --cut;
+          name[cut ? cut : kMaxName] = 0;
+        }
+        _snwprintf_s(text, _countof(text), _TRUNCATE, L"Bluetooth - %s", name);
+      }
+    }
+    if (wcscmp(text, state->row_text) != 0 &&
+        SetString(state->volume_button, L"Text", text))
+      wcscpy_s(state->row_text, text);
+  }
+  const bool visible = info.connected != FALSE || bluetooth;
   if (visible == state->visible) return;
   // All handles belong to this scene, and this timer runs on its UI thread.
   if (!visible) {
@@ -257,7 +452,7 @@ void RefreshRowVisibility(VolumeScene* state) {
 }
 
 void Synchronize(VolumeScene* state) {
-  if (!state || !state->slider || state->synchronizing) return;
+  if (!state || !state->slider || state->synchronizing || state->bluetooth) return;
   state->synchronizing = true;
   LONG volume = AudioGetVolume();
   g_xui.set_slider(state->slider, volume);
@@ -592,7 +787,9 @@ HRESULT APIENTRY VolumeObjectProc(HXUIOBJ object, XUIMessage* message, void* ins
       message->bHandled = TRUE;
     } else if (notify->dwNotify == XN_PRESS) {
       BYTE user = PressUser(notify);
-      if (source == state->volume_button)
+      if (source == state->volume_button && state->bluetooth)
+        OpenBluetooth(state, user);
+      else if (source == state->volume_button)
         SetExpanded(state, !state->expanded, user);
       else if (source == state->dismiss_button || source == state->confirm_button)
         SetExpanded(state, false, user);
@@ -851,6 +1048,564 @@ bool OpenSettings(VolumeScene* state, BYTE user) {
   return SUCCEEDED(result);
 }
 
+// ---------------------------------------------------------------------------
+// Bluetooth page (Guide -> Media -> Bluetooth). Stage 1b: adapter status,
+// Scan, and the devices found. Pairing and the paired list arrive in stage 2.
+
+void Utf8ToWide(const char* in, WCHAR* out, size_t capacity) {
+  size_t n = 0;
+  const unsigned char* p = (const unsigned char*)in;
+  while (*p && n + 1 < capacity) {
+    unsigned c = *p++;
+    unsigned extra = c < 0x80 ? 0 : (c & 0xE0) == 0xC0 ? 1 : (c & 0xF0) == 0xE0 ? 2 : 3;
+    if (extra) c &= 0x3F >> extra;
+    bool valid = c >= 0x20 || extra;
+    for (unsigned i = 0; i < extra; ++i) {
+      if ((*p & 0xC0) != 0x80) { valid = false; break; }
+      c = (c << 6) | (*p++ & 0x3F);
+    }
+    out[n++] = valid && c <= 0xFFFF ? (WCHAR)c : L'?';
+  }
+  out[n] = 0;
+}
+
+void FormatAddress(const BYTE* a, WCHAR* out, size_t capacity) {
+  _snwprintf_s(out, capacity, _TRUNCATE, L"%02X:%02X:%02X:%02X:%02X:%02X",
+               a[5], a[4], a[3], a[2], a[1], a[0]);
+}
+
+LPCWSTR DeviceKind(DWORD cod) {
+  switch ((cod >> 8) & 0x1F) {
+    case 1: return L"Computer";
+    case 2: return L"Phone";
+    case 4: return L"Audio";
+    case 5: return L"Peripheral";
+    case 7: return L"Wearable";
+    default: return L"Device";
+  }
+}
+
+void SetBluetoothNavigation(BluetoothScene* state, unsigned shown,
+                            unsigned paired) {
+  WCHAR up[16], down[16];
+  LPCWSTR left_target = paired ? L"BtPaired0" : L"BtScanButton";
+  for (unsigned i = 0; i < shown; ++i) {
+    _snwprintf_s(up, _countof(up), _TRUNCATE, L"BtDevice%u", i ? i - 1 : 0);
+    _snwprintf_s(down, _countof(down), _TRUNCATE, L"BtDevice%u", i + 1 < shown ? i + 1 : i);
+    SetString(state->devices[i], L"NavUp", up);
+    SetString(state->devices[i], L"NavDown", down);
+    SetString(state->devices[i], L"NavLeft", left_target);
+  }
+  LPCWSTR right_target = shown ? L"BtDevice0" : 0;
+  for (unsigned i = 0; i < paired; ++i) {
+    _snwprintf_s(up, _countof(up), _TRUNCATE, L"BtPaired%u", i ? i - 1 : 0);
+    if (i + 1 < paired)
+      _snwprintf_s(down, _countof(down), _TRUNCATE, L"BtPaired%u", i + 1);
+    else
+      wcscpy_s(down, L"BtVolumeSlider");
+    SetString(state->paired[i], L"NavUp", up);
+    SetString(state->paired[i], L"NavDown", down);
+    if (right_target) SetString(state->paired[i], L"NavRight", right_target);
+    else {
+      WCHAR self[16];
+      _snwprintf_s(self, _countof(self), _TRUNCATE, L"BtPaired%u", i);
+      SetString(state->paired[i], L"NavRight", self);
+    }
+  }
+  if (paired) {
+    _snwprintf_s(up, _countof(up), _TRUNCATE, L"BtPaired%u", paired - 1);
+    SetString(state->volume_slider, L"NavUp", up);
+  } else {
+    SetString(state->volume_slider, L"NavUp", L"BtVolumeSlider");
+  }
+  SetString(state->scan_button, L"NavUp", L"BtVolumeSlider");
+  SetString(state->scan_button, L"NavRight", shown ? L"BtDevice0" : L"BtScanButton");
+}
+
+bool SameAddress(const BYTE* a, const BYTE* b) { return memcmp(a, b, 6) == 0; }
+
+void PairedLabel(const BluetoothUiPaired& p, WCHAR* out, size_t capacity) {
+  if (p.name[0]) Utf8ToWide(p.name, out, capacity);
+  else FormatAddress(p.address, out, capacity);
+}
+
+// Short reason for a failed attempt (HCI status codes, Core Vol 1 Part F).
+LPCWSTR LinkFailureText(DWORD failure, DWORD status) {
+  if (failure == 3 && status == 0x04) return L"it didn't answer. Is it on and nearby?";
+  if (failure == 4 && (status == 0x05 || status == 0x06))
+    return L"it refused the pairing. Put it in pairing mode and pair again.";
+  if (failure == 4 || failure == 5) return L"pairing failed.";
+  if (failure == 2) return L"it took too long.";
+  if (failure == 6) return L"it disconnected.";
+  return L"the adapter reported an error.";
+}
+
+void RefreshBluetoothVolume(BluetoothScene* state) {
+  if (!state || !state->volume_slider || !state->volume_text) return;
+  LONG volume = AudioGetVolume();
+  bool muted = AudioIsOutputMuted() != FALSE;
+  LONG key = muted ? -1 - volume : volume;
+  if (key == state->shown_volume) return;
+  state->shown_volume = key;
+  state->synchronizing = true;
+  g_xui.set_slider(state->volume_slider, volume);
+  state->synchronizing = false;
+  WCHAR text[48];
+  _snwprintf_s(text, _countof(text), _TRUNCATE, muted ? L"Volume  %d%% (muted)"
+                                                      : L"Volume  %d%%", (int)volume);
+  g_xui.set_text(state->volume_text, text);
+}
+
+void RefreshBluetooth(BluetoothScene* state, bool force) {
+  RefreshBluetoothVolume(state);
+  BluetoothUiState ui;
+  if (!state || !BluetoothGetUiState(&ui)) return;
+  bool notice = state->notice[0] && (LONG)(GetTickCount() - state->notice_until) < 0;
+  if (!notice) state->notice[0] = 0;
+  if (!force && state->have_state && ui.sequence == state->ui.sequence && !notice) return;
+  state->ui = ui;
+  state->have_state = true;
+
+  WCHAR text[256], address[24];
+  if (ui.status == kBluetoothNoAdapter) {
+    wcscpy_s(text, L"No Bluetooth adapter connected");
+  } else if (ui.address_valid) {
+    FormatAddress(ui.address, address, _countof(address));
+    _snwprintf_s(text, _countof(text), _TRUNCATE, L"Adapter %s%s", address,
+                 ui.manufacturer == 10 ? L" (CSR)" : L"");
+  } else {
+    wcscpy_s(text, L"Bluetooth adapter");
+  }
+  g_xui.set_text(state->adapter_text, text);
+
+  unsigned count = ui.device_count < kBluetoothButtons ? ui.device_count : kBluetoothButtons;
+  if (ui.link_result_count != state->seen_results) {
+    // An attempt just ended: say how, for a few seconds.
+    state->seen_results = ui.link_result_count;
+    if (state->have_seen_results) {
+      WCHAR name[64] = L"the device";
+      for (unsigned i = 0; i < ui.paired_count && i < 3; ++i)
+        if (SameAddress(ui.paired[i].address, ui.result_address))
+          PairedLabel(ui.paired[i], name, _countof(name));
+      for (unsigned i = 0; i < ui.device_count && i < 16; ++i)
+        if (SameAddress(ui.devices[i].address, ui.result_address) && ui.devices[i].name[0])
+          Utf8ToWide(ui.devices[i].name, name, _countof(name));
+      if (ui.link_failure == 0)
+        _snwprintf_s(state->notice, _countof(state->notice), _TRUNCATE,
+                     L"Connected to %.40s.", name);
+      else
+        _snwprintf_s(state->notice, _countof(state->notice), _TRUNCATE,
+                     L"Couldn't connect to %.40s: %s (%02X)", name,
+                     LinkFailureText(ui.link_failure, ui.link_status), ui.link_status);
+      state->notice_until = GetTickCount() + 6000;
+      notice = true;
+    }
+  }
+  state->have_seen_results = true;
+  if (notice) {
+    wcscpy_s(text, state->notice);
+  } else if (ui.link == kBluetoothLinkConnecting) {
+    wcscpy_s(text, ui.link_paired_now
+        ? L"Paired. Finishing the connection..."
+        : L"Connecting... If this is a new device, keep it in pairing mode.");
+  } else if (ui.link == kBluetoothLinkConnected) {
+    switch (ui.audio) {
+      case kBluetoothAudioPlaying:
+        wcscpy_s(text, L"Playing console audio over Bluetooth.");
+        break;
+      case kBluetoothAudioPaused:
+        wcscpy_s(text, L"Connected. The headphones paused the audio.");
+        break;
+      case kBluetoothAudioFailed:
+        _snwprintf_s(text, _countof(text), _TRUNCATE,
+                     L"Connected, but audio couldn't start (A2DP %u/%X).",
+                     ui.audio_failure, ui.audio_detail);
+        break;
+      default:
+        wcscpy_s(text, L"Connected. Starting audio...");
+        break;
+    }
+  } else {
+    switch (ui.status) {
+      case kBluetoothStarting: wcscpy_s(text, L"Starting the adapter..."); break;
+      case kBluetoothScanning:
+        _snwprintf_s(text, _countof(text), _TRUNCATE,
+                     L"Searching for devices... %u found so far.", ui.device_count);
+        break;
+      case kBluetoothIdle:
+        wcscpy_s(text, L"Put headphones in pairing mode, then select Pair new device.");
+        break;
+      case kBluetoothReady:
+        if (ui.device_count)
+          _snwprintf_s(text, _countof(text), _TRUNCATE,
+              L"Found %u device(s). Select one to pair.", ui.device_count);
+        else
+          wcscpy_s(text, L"No devices found. Check the headphones are in pairing mode and try again.");
+        break;
+      case kBluetoothError:
+        _snwprintf_s(text, _countof(text), _TRUNCATE,
+                     L"Adapter stopped (error %04X). Unplug it and plug it back in.", ui.error);
+        break;
+      default: wcscpy_s(text, L"Connect a USB Bluetooth adapter to search for devices."); break;
+    }
+  }
+  g_xui.set_text(state->status_text, text);
+  SetBool(state->scan_button, L"Enabled",
+          (ui.status == kBluetoothReady || ui.status == kBluetoothIdle) &&
+          ui.link == kBluetoothLinkNone);
+
+  HXUIOBJ focus = g_xui.tree_focus(state->object);
+  for (unsigned i = 0; i < kBluetoothButtons; ++i) {
+    bool show = i < count;
+    if (show) {
+      const BluetoothUiDevice& d = ui.devices[i];
+      WCHAR name[64];
+      if (d.name[0]) {
+        // The name alone fits the row; the device kind made it truncate.
+        Utf8ToWide(d.name, name, _countof(name));
+        _snwprintf_s(text, _countof(text), _TRUNCATE, L"%s", name);
+      } else {
+        FormatAddress(d.address, name, _countof(name));
+        _snwprintf_s(text, _countof(text), _TRUNCATE, L"%s  (%s)", name,
+                     DeviceKind(d.class_of_device));
+      }
+      // Buttons take their label through the Text property; set_text only
+      // updates text elements (the label stayed blank on COD).
+      SetString(state->devices[i], L"Text", text);
+    } else if (focus == state->devices[i]) {
+      g_xui.set_user_focus(state->scan_button, g_xui.focus_user(focus));
+    }
+    SetBool(state->devices[i], L"Show", show);
+    SetBool(state->devices[i], L"Enabled", show);
+  }
+  // Paired devices: name plus link state; pressing toggles the connection.
+  unsigned paired = ui.paired_count < kBluetoothPairedButtons
+      ? ui.paired_count : kBluetoothPairedButtons;
+  for (unsigned i = 0; i < kBluetoothPairedButtons; ++i) {
+    bool show = i < paired;
+    if (show) {
+      WCHAR name[64];
+      PairedLabel(ui.paired[i], name, _countof(name));
+      LPCWSTR suffix = L"";
+      if (ui.link != kBluetoothLinkNone && SameAddress(ui.link_address, ui.paired[i].address)) {
+        suffix = ui.link == kBluetoothLinkConnected
+                   ? (ui.audio == kBluetoothAudioPlaying ? L"  - Playing" : L"  - Connected")
+               : ui.link == kBluetoothLinkDisconnecting ? L"  - Disconnecting..."
+               : L"  - Connecting...";
+      }
+      _snwprintf_s(text, _countof(text), _TRUNCATE, L"%.40s%s", name, suffix);
+      SetString(state->paired[i], L"Text", text);
+    } else if (focus == state->paired[i]) {
+      g_xui.set_user_focus(state->scan_button, g_xui.focus_user(focus));
+    }
+    SetBool(state->paired[i], L"Show", show);
+    SetBool(state->paired[i], L"Enabled", show && ui.status != kBluetoothNoAdapter);
+  }
+  SetBool(state->paired_text, L"Show", paired == 0);
+  if (count != state->shown || paired != state->paired_shown || force) {
+    SetBluetoothNavigation(state, count, paired);
+    state->shown = count;
+    state->paired_shown = paired;
+  }
+}
+
+HRESULT APIENTRY CreateBluetooth(HXUIOBJ, void** instance) {
+  if (!instance) return E_INVALIDARG;
+  *instance = calloc(1, sizeof(BluetoothScene));
+  return *instance ? S_OK : E_OUTOFMEMORY;
+}
+
+HRESULT APIENTRY BluetoothObjectProc(HXUIOBJ object, XUIMessage* message,
+                                     void* instance) {
+  BluetoothScene* state = (BluetoothScene*)instance;
+  if (!state || !message) return S_OK;
+  if (message->dwMessage == XM_INIT) {
+    state->object = object;
+    state->back_button = Find(object, L"BtBackButton");
+    state->adapter_text = Find(object, L"BtAdapterValue");
+    state->status_text = Find(object, L"BtStatus");
+    state->scan_button = Find(object, L"BtScanButton");
+    WCHAR id[16];
+    for (unsigned i = 0; i < kBluetoothButtons; ++i) {
+      _snwprintf_s(id, _countof(id), _TRUNCATE, L"BtDevice%u", i);
+      state->devices[i] = Find(object, id);
+      if (!state->devices[i]) return E_FAIL;
+    }
+    for (unsigned i = 0; i < kBluetoothPairedButtons; ++i) {
+      _snwprintf_s(id, _countof(id), _TRUNCATE, L"BtPaired%u", i);
+      state->paired[i] = Find(object, id);
+      if (!state->paired[i]) return E_FAIL;
+    }
+    state->forget_button = Find(object, L"BtForgetButton");
+    state->paired_text = Find(object, L"BtPairedValue");
+    state->volume_text = Find(object, L"BtVolumeValue");
+    state->volume_slider = Find(object, L"BtVolumeSlider");
+    state->shown_volume = -1000;
+    if (!state->back_button || !state->adapter_text || !state->status_text ||
+        !state->scan_button || !state->forget_button || !state->paired_text ||
+        !state->volume_text || !state->volume_slider)
+      return E_FAIL;
+    RefreshBluetooth(state, true);
+    return g_xui.set_timer(object, kBluetoothRefreshTimer, 250);
+  } else if (message->dwMessage == XM_TIMER && message->pvData &&
+      message->cbData >= sizeof(XUIMessageTimer) &&
+      ((XUIMessageTimer*)message->pvData)->nId == kBluetoothRefreshTimer) {
+    if (state->focus_pending && !g_xui.in_transition(object)) {
+      g_xui.set_user_focus(state->shown ? state->devices[0] : state->scan_button, state->user);
+      state->focus_pending = false;
+    }
+    RefreshBluetooth(state, false);
+  } else if (message->dwMessage == XM_TRANSITION_END && message->pvData &&
+      message->cbData >= sizeof(XUIMessageTransition)) {
+    DWORD transition = ((XUIMessageTransition*)message->pvData)->dwTransType;
+    if (transition == XUI_TRANSITION_TO || transition == XUI_TRANSITION_BACKTO)
+      state->focus_pending = true;
+  } else if (message->dwMessage == XM_DESTROY) {
+    g_xui.kill_timer(object, kBluetoothRefreshTimer);
+  } else if (message->dwMessage == XM_NOTIFY && message->pvData &&
+             message->cbData >= sizeof(XUINotify)) {
+    XUINotify* notify = (XUINotify*)message->pvData;
+    if (notify->dwNotify == XN_VALUE_CHANGED &&
+        notify->hObjSource == state->volume_slider) {
+      int volume = 0;
+      if (!state->synchronizing &&
+          g_xui.get_slider(state->volume_slider, &volume) >= 0) {
+        AudioSetVolume(volume);
+        RefreshBluetoothVolume(state);
+      }
+      message->bHandled = TRUE;
+      return S_OK;
+    }
+    if (notify->dwNotify != XN_PRESS) return S_OK;
+    if (notify->hObjSource == state->back_button) {
+      SettingsBack(object, PressUser(notify));
+      message->bHandled = TRUE;
+    } else if (notify->hObjSource == state->scan_button) {
+      BluetoothRequestScan();
+      wcscpy_s(state->notice, L"Searching for devices...");
+      state->notice_until = GetTickCount() + 1500;
+      RefreshBluetooth(state, true);
+      message->bHandled = TRUE;
+    } else if (notify->hObjSource == state->forget_button) {
+      // X on a focused paired device forgets it.
+      HXUIOBJ focus = g_xui.tree_focus(object);
+      bool done = false;
+      for (unsigned i = 0; i < state->paired_shown; ++i) {
+        if (focus != state->paired[i]) continue;
+        WCHAR name[64];
+        PairedLabel(state->ui.paired[i], name, _countof(name));
+        BluetoothRequestForget(state->ui.paired[i].address);
+        _snwprintf_s(state->notice, _countof(state->notice), _TRUNCATE,
+                     L"Forgot %.40s.", name);
+        done = true;
+      }
+      if (!done)
+        wcscpy_s(state->notice, L"Select a paired device, then press X to forget it.");
+      state->notice_until = GetTickCount() + 3000;
+      RefreshBluetooth(state, true);
+      message->bHandled = TRUE;
+    } else {
+      for (unsigned i = 0; i < state->shown; ++i) {
+        if (notify->hObjSource != state->devices[i]) continue;
+        WCHAR name[64];
+        const BluetoothUiDevice& d = state->ui.devices[i];
+        if (d.name[0]) Utf8ToWide(d.name, name, _countof(name));
+        else FormatAddress(d.address, name, _countof(name));
+        if (state->ui.link != kBluetoothLinkNone) {
+          wcscpy_s(state->notice, L"Disconnect the current device first.");
+        } else {
+          BluetoothRequestPair(d.address);
+          _snwprintf_s(state->notice, _countof(state->notice), _TRUNCATE,
+                       L"Pairing with %.40s...", name);
+        }
+        state->notice_until = GetTickCount() + 2000;
+        RefreshBluetooth(state, true);
+        message->bHandled = TRUE;
+        break;
+      }
+      for (unsigned i = 0; i < state->paired_shown; ++i) {
+        if (notify->hObjSource != state->paired[i]) continue;
+        const BluetoothUiPaired& p = state->ui.paired[i];
+        bool this_link = state->ui.link != kBluetoothLinkNone &&
+            SameAddress(state->ui.link_address, p.address);
+        if (state->ui.link != kBluetoothLinkNone && !this_link) {
+          wcscpy_s(state->notice, L"Disconnect the current device first.");
+          state->notice_until = GetTickCount() + 2000;
+        } else {
+          BluetoothRequestToggle(p.address);
+        }
+        RefreshBluetooth(state, true);
+        message->bHandled = TRUE;
+        break;
+      }
+    }
+  }
+  return S_OK;
+}
+
+bool RegisterBluetoothClass() {
+  if (g_bluetooth_class_handle) return true;
+  memset(&g_bluetooth_class, 0, sizeof(g_bluetooth_class));
+  g_bluetooth_class.szClassName = L"UsbAudioBluetoothScene";
+  g_bluetooth_class.szBaseClassName = L"HUDScene";  // Same as the settings blade.
+  g_bluetooth_class.Methods.CreateInstance = CreateBluetooth;
+  g_bluetooth_class.Methods.DestroyInstance = DestroyState;
+  g_bluetooth_class.Methods.ObjectProc = BluetoothObjectProc;
+  HRESULT result = g_xui.register_class(&g_bluetooth_class,
+                                        &g_bluetooth_class_handle);
+  return SUCCEEDED(result) && g_bluetooth_class_handle;
+}
+
+HXUIOBJ CreateBluetoothPanel() {
+  struct Element {
+    LPCWSTR type, id;
+    float x, y, width, height;
+    LPCWSTR text, visual;
+    float font;
+  };
+  const Element elements[] = {
+    {XUI_CLASS_LABEL, L"BtTitle", 156, 36, 272, 25, L"Bluetooth", L"Label_Head", 0},
+    {XUI_CLASS_TEXT, L"BtAdapterValue", 154, 76, 540, 22, L"Bluetooth adapter", 0, 11},
+    {XUI_CLASS_TEXT, L"BtPairedHeading", 154, 109, 240, 24, L"Paired devices", 0, 14},
+    {XUI_CLASS_TEXT, L"BtPairedValue", 154, 145, 240, 60,
+     L"No paired devices yet. Select a device on the right to pair it.", 0, 11},
+    {XUI_CLASS_BUTTON, L"BtPaired0", 144, 139, 260, 28, L"", L"XuiButtonGuide", 12},
+    {XUI_CLASS_BUTTON, L"BtPaired1", 144, 173, 260, 28, L"", L"XuiButtonGuide", 12},
+    {XUI_CLASS_BUTTON, L"BtPaired2", 144, 207, 260, 28, L"", L"XuiButtonGuide", 12},
+    {XUI_CLASS_TEXT, L"BtAvailableHeading", 454, 109, 240, 24, L"Available devices", 0, 14},
+    {XUI_CLASS_BUTTON, L"BtDevice0", 444, 139, 260, 28, L"", L"XuiButtonGuide", 12},
+    {XUI_CLASS_BUTTON, L"BtDevice1", 444, 173, 260, 28, L"", L"XuiButtonGuide", 12},
+    {XUI_CLASS_BUTTON, L"BtDevice2", 444, 207, 260, 28, L"", L"XuiButtonGuide", 12},
+    {XUI_CLASS_BUTTON, L"BtDevice3", 444, 241, 260, 28, L"", L"XuiButtonGuide", 12},
+    {XUI_CLASS_BUTTON, L"BtDevice4", 444, 275, 260, 28, L"", L"XuiButtonGuide", 12},
+    {XUI_CLASS_BUTTON, L"BtDevice5", 444, 309, 260, 28, L"", L"XuiButtonGuide", 12},
+    {XUI_CLASS_BUTTON, L"BtScanButton", 144, 352, 260, 28, L"Pair new device", L"XuiButtonGuide", 12},
+    {XUI_CLASS_TEXT, L"BtStatus", 154, 304, 240, 44, L"", 0, 10},
+    // Input-only B handler; the Guide shell supplies the visible Back legend.
+    {XUI_CLASS_BUTTON, L"BtBackButton", 0, 0, 0, 0, 0, 0, 0},
+    // Input-only X handler: forget the focused paired device.
+    {XUI_CLASS_BUTTON, L"BtForgetButton", 0, 0, 0, 0, 0, 0, 0},
+    {XUI_CLASS_FIGURE, L"BtDivider", 424, 110, 1, 279, 0, 0, 0},
+    // Output volume; the Bluetooth stream carries the same mix and gain.
+    {XUI_CLASS_TEXT, L"BtVolumeValue", 154, 246, 240, 22, L"Volume", 0, 12},
+    {XUI_CLASS_SLIDER, L"BtVolumeSlider", 154, 274, 240, 22, 0, L"Slider_Volume", 0}
+  };
+  const unsigned count = _countof(elements);
+  const unsigned first_paired = 4, first_device = 8, scan = 14, back = 16,
+                 forget = 17, divider = 18, volume = 20;
+  HXUIOBJ scene = 0, children[_countof(elements)] = {0};
+  unsigned owned = 0;
+  if (g_xui.create(L"UsbAudioBluetoothScene", &scene) < 0 || !scene) goto fail;
+  if (!ConfigureElement(scene, L"UsbAudioBluetooth", 852, 480, 0, 0) ||
+      !SetString(scene, L"DefaultFocus", L"BtScanButton") ||
+      !SetString(scene, L"LegendB", L"Back") ||
+      !SetString(scene, L"TransTo", L"FadeIn")) goto fail;
+  for (unsigned i = 0; i < count; ++i) {
+    const Element& e = elements[i];
+    if (g_xui.create(e.type, &children[i]) < 0 || !children[i] ||
+        !ConfigureElement(children[i], e.id, e.width, e.height, e.x, e.y)) goto fail;
+    if (e.text && !SetString(children[i], L"Text", e.text)) goto fail;
+    if (e.visual && !SetString(children[i], L"Visual", e.visual)) goto fail;
+    if (e.font && !SetFloat(children[i], L"PointSize", e.font)) goto fail;
+    if (wcscmp(e.type, XUI_CLASS_TEXT) == 0) {
+      if (!SetUint(children[i], L"TextColor", 0xff333333, true) ||
+          !SetUint(children[i], L"TextStyle", 0, false)) goto fail;
+    }
+  }
+  for (unsigned i = first_paired; i < first_paired + kBluetoothPairedButtons; ++i) {
+    if (!SetString(children[i], L"NavLeft", elements[i].id) ||
+        !SetString(children[i], L"NavRight", elements[i].id) ||
+        !SetBool(children[i], L"Show", FALSE) ||
+        !SetBool(children[i], L"Enabled", FALSE)) goto fail;
+  }
+  if (!SetUint(children[forget], L"PressKey", VK_PAD_X, false) ||
+      !SetBool(children[forget], L"UnfocusedInput", TRUE)) goto fail;
+  // Optional: older shells may not have an X legend slot.
+  SetString(scene, L"LegendX", L"Forget");
+  for (unsigned i = first_device; i < first_device + kBluetoothButtons; ++i) {
+    if (!SetString(children[i], L"NavLeft", L"BtScanButton") ||
+        !SetString(children[i], L"NavRight", elements[i].id) ||
+        !SetBool(children[i], L"Show", FALSE) ||
+        !SetBool(children[i], L"Enabled", FALSE)) goto fail;
+  }
+  if (!SetInt(children[volume], L"RangeMin", 0) ||
+      !SetInt(children[volume], L"RangeMax", 100) ||
+      !SetInt(children[volume], L"Value", AudioGetVolume()) ||
+      !SetInt(children[volume], L"Step", 5) ||
+      !SetInt(children[volume], L"AccelInc", 0) ||
+      !SetString(children[volume], L"NavLeft", L"BtVolumeSlider") ||
+      !SetString(children[volume], L"NavRight", L"BtVolumeSlider") ||
+      !SetString(children[volume], L"NavUp", L"BtVolumeSlider") ||
+      !SetString(children[volume], L"NavDown", L"BtScanButton")) goto fail;
+  if (!SetString(children[scan], L"NavUp", L"BtVolumeSlider") ||
+      !SetString(children[scan], L"NavDown", L"BtScanButton") ||
+      !SetString(children[scan], L"NavLeft", L"BtScanButton") ||
+      !SetString(children[scan], L"NavRight", L"BtScanButton") ||
+      !SetUint(children[back], L"PressKey", VK_PAD_B_OR_BACK, false) ||
+      !SetBool(children[back], L"UnfocusedInput", TRUE) ||
+      !MeterRectangle(children[divider], 1, 279, 0xffb4babd)) goto fail;
+  for (unsigned i = 0; i < count; ++i) {
+    if (g_xui.add_child(scene, children[i]) < 0) goto fail;
+    ++owned;
+  }
+  for (unsigned i = 0; i < count; ++i)
+    if (!InitializeObject(children[i])) goto fail;
+  if (!InitializeObject(scene)) goto fail;
+  {
+    XUIMessage message;
+    XuiMessage(&message, XM_SKIN_CHANGED);
+    if (g_xui.broadcast(scene, &message) < 0) goto fail;
+    // Same fit as the settings page: Slider_Volume is authored 270 wide.
+    D3DXVECTOR3 scale(240.0f / 270.0f, 1, 1);
+    if (!SetFloat(children[volume], L"Width", 270) ||
+        g_xui.set_scale(children[volume], &scale) < 0) goto fail;
+  }
+  return scene;
+fail:
+  for (unsigned i = owned; i < count; ++i)
+    if (children[i]) g_xui.destroy(children[i]);
+  if (scene) g_xui.destroy(scene);
+  return 0;
+}
+
+// Same navigation contract as OpenSettings: expanded pages navigate from
+// the validated outer Guide HUDScene with OpenType Full (2).
+bool OpenBluetooth(VolumeScene* state, BYTE user) {
+  if (!state || !state->host_scene || !RegisterBluetoothClass()) return false;
+  HXUIOBJ guide_scene = g_guide_main_scene;
+  LPCWSTR guide_id = 0;
+  if (!guide_scene || !g_xui.valid(guide_scene) ||
+      g_xui.in_transition(guide_scene) ||
+      g_xui.id(guide_scene, &guide_id) < 0 || !guide_id ||
+      wcscmp(guide_id, L"HUDScene") != 0) return false;
+  PropertyValue previous_open_type, open_type;
+  if (!GetProperty(guide_scene, L"OpenType", &previous_open_type) ||
+      previous_open_type.get()->type != XUI_EPT_UNSIGNED) return false;
+
+  HXUIOBJ page = CreateBluetoothPanel();
+  if (!page) return false;
+  void* raw = 0;
+  HXUIOBJ implementation = g_xui.cast(page, g_bluetooth_class_handle);
+  if (!implementation || g_xui.instance(implementation, &raw) < 0 || !raw) {
+    g_xui.destroy(page);
+    return false;
+  }
+  ((BluetoothScene*)raw)->user = user;
+  if (!SetUint(page, L"OpenType", 2, false) ||
+      !GetProperty(page, L"OpenType", &open_type) ||
+      open_type.get()->type != XUI_EPT_UNSIGNED || open_type.get()->uVal != 2) {
+    SetProperty(guide_scene, L"OpenType", &previous_open_type);
+    g_xui.destroy(page);
+    return false;
+  }
+  HRESULT result = g_xui.navigate_forward(guide_scene, FALSE, page, user);
+  if (FAILED(result)) {
+    SetProperty(guide_scene, L"OpenType", &previous_open_type);
+    g_xui.destroy(page);
+  }
+  return SUCCEEDED(result);
+}
+
 HXUIOBJ CreateVolumePanel(HXUIOBJ parent, float x, float y) {
   // XAM's Guide loader requires XUR 8; the public XDK compiler emits XUR 5.
   // Construct native objects instead, without a second/private XUI runtime.
@@ -1006,6 +1761,33 @@ bool InjectMedia(HXUIOBJ scene) {
     return false;
   }
   state->host_scene = scene;
+  {
+    PropertyValue visual, point;
+    if (GetProperty(above, L"Visual", &visual) && visual.get()->type == XUI_EPT_STRING &&
+        visual.get()->szVal && wcslen(visual.get()->szVal) < _countof(state->row_visual))
+      wcscpy_s(state->row_visual, visual.get()->szVal);
+    if (GetProperty(above, L"PointSize", &point) && point.get()->type == XUI_EPT_FLOAT &&
+        point.get()->fVal >= 8 && point.get()->fVal <= 24)
+      state->row_point_size = point.get()->fVal;
+    const float gap_top = above_rect.y + above_rect.height;
+    const float gap = next_rect.y - gap_top;
+    if (gap >= 28 && gap <= 40) {
+      // Tuned live on COD (gap 31: y +3.0, height 24 relative to a panel
+      // 1.5 below the gap top): the top divider lands on the line under the
+      // row above and the bottom one on Select Music's line.
+      state->gap_offset = gap_top + 4.5f - insertion_y;
+      state->cell_top = gap_top - insertion_y;
+      state->row_height = 55.0f - gap;
+      state->gap_height = gap;
+    }
+    char line[160];
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+                "guide row visual=%ls point=%d gap_top=%d gap=%d panel_y=%d offset=%d (x100)",
+                state->row_visual[0] ? state->row_visual : L"?",
+                (int)state->row_point_size, (int)(gap_top * 100), (int)(gap * 100),
+                (int)(insertion_y * 100), (int)(state->gap_offset * 100));
+    DiagnosticsText(line);
+  }
   state->above_button = above;
   state->next_button = next;
   wcscpy_s(state->old_down, old_down.get()->szVal ? old_down.get()->szVal : L"");

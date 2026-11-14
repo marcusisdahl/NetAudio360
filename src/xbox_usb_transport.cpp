@@ -60,7 +60,7 @@ __declspec(naked) DWORD CurrentIrql() {
 DWORD Context() { return (GetCurrentProcessorNumber() << 16) | CurrentIrql(); }
 bool InDomain() { return Context() == ((g_processor << 16) | 2); }
 
-enum Operation { kOpenDefault, kOpen, kControl, kIsoch };
+enum Operation { kOpenDefault, kOpen, kControl, kAsync, kIsoch };
 struct DomainRequest { UsbDomainRoutine routine; void* context; LONG result; };
 VOID RunInDomain(void*, void* context, void*, void*) {
   DomainRequest* r = (DomainRequest*)context;
@@ -73,7 +73,7 @@ struct Request {
   void* handle;
   void* transfer;
   WORD* lengths;
-  int address, max_packet, interval;
+  int type, address, max_packet, interval;
   unsigned generation;
   LONG result;
 };
@@ -90,7 +90,7 @@ VOID Execute(void*, void* context, void*, void*) {
       if (r->result >= 0) g_default_endpoint = *(DWORD*)r->transfer;
       break;
     case kOpen:
-      r->result = ((OpenFn)g_api->usbd_open_endpoint)(r->handle, 1, r->address,
+      r->result = ((OpenFn)g_api->usbd_open_endpoint)(r->handle, r->type, r->address,
           r->max_packet, r->interval, (DWORD*)r->transfer);
       if (r->result >= 0) {
         DWORD endpoint = *(DWORD*)r->transfer;
@@ -101,11 +101,11 @@ VOID Execute(void*, void* context, void*, void*) {
           g_data_endpoints[g_data_endpoint_count++] = endpoint;
       }
       break;
-    case kControl: case kIsoch:
+    case kControl: case kAsync: case kIsoch:
       // Publish ownership before calling the host (completion can be immediate).
       if (!g_ownership.Submit(r->transfer, r->generation)) { r->result = -2; return; }
       r->result = 0;  // Accepted by adapter, not a USB completion status.
-      if (r->operation == kControl)
+      if (r->operation == kControl || r->operation == kAsync)
         ((ControlFn)g_api->usbd_queue_async_transfer)(r->handle, r->transfer);
       else ((IsochFn)g_api->usbd_queue_isoch_transfer)(r->handle, r->transfer, r->lengths);
       break;
@@ -113,12 +113,15 @@ VOID Execute(void*, void* context, void*, void*) {
 }
 
 LONG Dispatch(Operation op, void* handle, void* transfer, WORD* lengths,
-              int address, int max_packet, int interval) {
+              int type, int address, int max_packet, int interval) {
   // Never call the blocking dispatcher from DPC/interrupt context.
   if (!g_dispatch || !handle || !transfer || CurrentIrql() != 0) return -3;
+  // A TRB without an endpoint would reach the host controller as NULL.
+  if ((op == kControl || op == kAsync || op == kIsoch) && !*(DWORD*)transfer)
+    return -5;
   Request request;
   request.operation = op; request.handle = handle; request.transfer = transfer;
-  request.lengths = lengths; request.address = address;
+  request.lengths = lengths; request.type = type; request.address = address;
   request.max_packet = max_packet; request.interval = interval;
   request.generation = g_ownership.generation(); request.result = -4;
   LONG wait_status = g_dispatch(Execute, &request, g_processor, 0, 0);
@@ -276,6 +279,22 @@ BOOL UsbTransportRearm() {
   return status >= 0 && request.result == 0;
 }
 
+namespace {
+VOID RunDetachedInDomain(void*, void* context, void*, void*) {
+  DomainRequest* r = (DomainRequest*)context;
+  if (!InDomain() || g_handle) { r->result = -1; return; }
+  r->routine(r->context);
+  r->result = 0;
+}
+}  // namespace
+
+LONG UsbTransportRunDetached(UsbDomainRoutine routine, void* context) {
+  if (!g_dispatch || !routine || CurrentIrql() != 0 || g_handle) return -3;
+  DomainRequest request = {routine, context, -4};
+  LONG wait_status = g_dispatch(RunDetachedInDomain, &request, g_processor, 0, 0);
+  return wait_status < 0 ? wait_status : request.result;
+}
+
 BOOL UsbTransportComplete(void* transfer) {
   UsbAudioDiagnostic[62] = Context();
   if (!InDomain()) { InterlockedExchange(&g_stopped, 1); return FALSE; }
@@ -287,17 +306,23 @@ BOOL UsbTransportIdleInDomain() {
 }
 
 LONG UsbTransportOpenDefault(void* h, DWORD* ep) {
-  return Dispatch(kOpenDefault, h, ep, 0, 0, 0, 0);
+  return Dispatch(kOpenDefault, h, ep, 0, 0, 0, 0, 0);
 }
-LONG UsbTransportOpen(void* h, int address, int max_packet, int interval, DWORD* ep) {
-  return Dispatch(kOpen, h, ep, 0, address, max_packet, interval);
+LONG UsbTransportOpen(void* h, int type, int address, int max_packet,
+                      int interval, DWORD* ep) {
+  if (type != kUsbEndpointIsoch && type != kUsbEndpointBulk &&
+      type != kUsbEndpointInterrupt) return -1;
+  return Dispatch(kOpen, h, ep, 0, type, address, max_packet, interval);
 }
 LONG UsbTransportControl(void* h, void* trb) {
-  return Dispatch(kControl, h, trb, 0, 0, 0, 0);
+  return Dispatch(kControl, h, trb, 0, 0, 0, 0, 0);
+}
+LONG UsbTransportAsync(void* h, void* trb) {
+  return Dispatch(kAsync, h, trb, 0, 0, 0, 0, 0);
 }
 LONG UsbTransportIsoch(void* h, void* trb, WORD* lengths) {
   if (!lengths) return -1;
-  return Dispatch(kIsoch, h, trb, lengths, 0, 0, 0);
+  return Dispatch(kIsoch, h, trb, lengths, 0, 0, 0, 0);
 }
 
 LONG UsbTransportRun(UsbDomainRoutine routine, void* context) {

@@ -5,20 +5,27 @@
 namespace usb_transport {
 
 // This state machine is serialized by the USB DPC domain. It deliberately
-// supports one claimed playback interface: additional interfaces follow the
-// kernel's normal unsupported-device path without touching plugin state.
+// supports one claimed interface, either a UAC playback interface or a
+// Bluetooth HCI interface: additional interfaces follow the kernel's normal
+// unsupported-device path without touching plugin state.
 class DeviceClaimGate {
  public:
-  DeviceClaimGate() : state_(kIdle), handle_(0) {}
+  enum Kind { kNone = 0, kAudio = 1, kBluetooth = 2 };
+
+  DeviceClaimGate() : state_(kIdle), handle_(0), kind_(kNone) {}
 
   bool available() const { return state_ == kIdle; }
 
-  bool Activate(void* handle) {
-    if (state_ != kIdle || !handle) return false;
+  bool Activate(void* handle, Kind kind = kAudio) {
+    if (state_ != kIdle || !handle || kind == kNone) return false;
     handle_ = handle;
+    kind_ = kind;
     state_ = kActive;
     return true;
   }
+
+  // Kind of the active or draining claim; kNone while idle.
+  Kind kind() const { return kind_; }
 
   bool BeginRemoval(void* handle) {
     if (state_ != kActive || handle != handle_) return false;
@@ -29,6 +36,7 @@ class DeviceClaimGate {
   bool CancelActivation(void* handle) {
     if (state_ != kActive || handle != handle_) return false;
     handle_ = 0;
+    kind_ = kNone;
     state_ = kIdle;
     return true;
   }
@@ -36,6 +44,7 @@ class DeviceClaimGate {
   bool CompleteRemoval() {
     if (state_ != kDraining) return false;
     handle_ = 0;
+    kind_ = kNone;
     state_ = kIdle;
     return true;
   }
@@ -50,6 +59,7 @@ class DeviceClaimGate {
   enum State { kIdle, kActive, kDraining };
   State state_;
   void* handle_;
+  Kind kind_;
 };
 
 }  // namespace usb_transport

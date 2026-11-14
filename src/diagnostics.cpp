@@ -35,6 +35,7 @@ enum EventType {
   kEventFailure = 5,
   kEventStreaming = 6,
   kEventDisconnected = 7,
+  kEventText = 8,
 };
 
 struct Event {
@@ -89,9 +90,10 @@ struct LoaderEntryPrefix {
 typedef char RequireLoaderNameAt24[
     offsetof(LoaderEntryPrefix, full_name) == 0x24 ? 1 : -1];
 
-static void Queue(DWORD type, const DWORD* values, unsigned value_count,
-                  const void* payload, DWORD payload_length) {
-  if (!g_initialized) return;
+static bool Queue(DWORD type, const DWORD* values, unsigned value_count,
+                  const void* payload, DWORD payload_length,
+                  bool count_drop = true) {
+  if (!g_initialized) return false;
   if (value_count > kValueCount) value_count = kValueCount;
   if (payload_length > kPayloadBytes) payload_length = kPayloadBytes;
   LONG start = InterlockedIncrement(&g_next_slot) - 1;
@@ -107,9 +109,10 @@ static void Queue(DWORD type, const DWORD* values, unsigned value_count,
     if (payload && payload_length)
       memcpy(slot.event.payload, payload, payload_length);
     InterlockedExchange(&slot.state, 1);
-    return;
+    return true;
   }
-  InterlockedIncrement(&g_dropped);
+  if (count_drop) InterlockedIncrement(&g_dropped);
+  return false;
 }
 
 static void RotateIfNeeded() {
@@ -137,6 +140,7 @@ static const char* DecisionName(DWORD decision) {
     case kDeviceSlotBusy: return "slot-busy";
     case kDeviceTransportRejected: return "transport-rejected";
     case kDeviceClaimed: return "claimed";
+    case kDeviceKernelClaimed: return "kernel-accepted";
     default: return "unknown";
   }
 }
@@ -152,6 +156,8 @@ static const char* RejectionName(DWORD rejection) {
     case 6: return "unsupported-uac-protocol";
     case 7: return "missing-controller";
     case 8: return "not-full-speed-ohci";
+    case 9: return "bluetooth-secondary-interface";
+    case 10: return "bluetooth-disabled";
     default: return "unknown";
   }
 }
@@ -221,10 +227,10 @@ static void WriteEvent(FILE* file, const Event& event) {
           "vid=%04lx pid=%04lx usb=%04lx device=%04lx "
           "device_class=%02lx/%02lx/%02lx configurations=%lu "
           "interface=%lu alt=%lu class=%02lx/%02lx/%02lx endpoints=%lu "
-          "controller=%lu rejection=%lu(%s)\n",
+          "controller=%lu hcd_flags=0x%02lx rejection=%lu(%s)\n",
           event.tick, DecisionName(v[0]), v[1], v[2], v[3], v[4], v[5],
           v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14],
-          v[15], v[16], v[17], RejectionName(v[17]));
+          v[15], v[16], v[18], v[17], RejectionName(v[17]));
       break;
     case kEventConfiguration:
       WriteConfiguration(file, event);
@@ -251,6 +257,10 @@ static void WriteEvent(FILE* file, const Event& event) {
       break;
     case kEventDisconnected:
       fprintf(file, "tick=%lu event=disconnected\n", event.tick);
+      break;
+    case kEventText:
+      fprintf(file, "tick=%lu event=bluetooth %.*s\n", event.tick,
+              (int)event.payload_length, (const char*)event.payload);
       break;
   }
 }
@@ -350,7 +360,8 @@ void DiagnosticsObserveDevice(const UsbAudioDeviceObservation& o) {
     o.usb_version, o.device_version, o.device_class, o.device_subclass,
     o.device_protocol, o.configuration_count, o.interface_number,
     o.alternate_setting, o.interface_class, o.interface_subclass,
-    o.interface_protocol, o.endpoint_count, o.controller, o.rejection, 0, 0
+    o.interface_protocol, o.endpoint_count, o.controller, o.rejection,
+    o.controller_flags, 0
   };
   Queue(kEventDevice, values, kValueCount, 0, 0);
 }
@@ -385,6 +396,12 @@ void DiagnosticsFailure(DWORD error, DWORD stage, DWORD request,
 
 void DiagnosticsStreaming() { Queue(kEventStreaming, 0, 0, 0, 0); }
 void DiagnosticsDisconnected() { Queue(kEventDisconnected, 0, 0, 0, 0); }
+
+bool DiagnosticsText(const char* text) {
+  if (!text) return false;
+  // Not counted as a drop: callers retry while the queue is full.
+  return Queue(kEventText, 0, 0, text, (DWORD)strlen(text), false);
+}
 
 void DiagnosticsTick() {
   if (!g_initialized) return;
