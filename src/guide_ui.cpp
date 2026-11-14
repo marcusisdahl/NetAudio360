@@ -261,7 +261,11 @@ bool DacConnected() {
 // Bluetooth page and the audio-only buttons are hidden.
 void SetRowMode(VolumeScene* state, bool bluetooth) {
   if (state->expanded) SetExpanded(state, false, XUSER_INDEX_FOCUS, false);
-  bool ok = SetString(state->title, L"Text", bluetooth ? L"Bluetooth" : L"USB Audio") &&
+  // The lone Bluetooth button takes the row's rightmost cell (the options
+  // slot), so it lines up with the end of the other Media rows.
+  D3DXVECTOR3 position(bluetooth ? 265.0f : 161.0f, 0, 0);
+  bool ok = g_xui.set_position(state->volume_button, &position) >= 0 &&
+      SetString(state->title, L"Text", bluetooth ? L"Bluetooth" : L"USB Audio") &&
       SetString(state->volume_button, L"ImagePath",
                 bluetooth ? g_options_icon : g_volume_icon) &&
       SetBool(state->microphone_button, L"Show", !bluetooth) &&
