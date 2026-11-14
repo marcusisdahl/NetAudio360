@@ -63,6 +63,12 @@ BOOL AudioSetVolume(LONG percent);
 LONG AudioGetVolume();
 VOID AudioSetOutputMuted(BOOL muted);
 BOOL AudioIsOutputMuted();
+// Bluetooth output reads the same captured system mix (48 kHz stereo, with
+// the USB Audio volume and mute applied) while no USB DAC owns it. Frames
+// are 16-bit interleaved stereo. Single consumer: the Bluetooth worker.
+UINT AudioBluetoothPcmAvailable();
+UINT AudioReadBluetoothPcm(SHORT* out, UINT frames);
+VOID AudioDiscardBluetoothPcm();
 VOID AudioSetMicrophoneMuted(BOOL muted);
 BOOL AudioIsMicrophoneMuted();
 BOOL AudioSetMicrophoneGain(LONG percent);

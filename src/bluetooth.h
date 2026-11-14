@@ -38,6 +38,13 @@ enum BluetoothUiLink {
   kBluetoothLinkConnected = 2,
   kBluetoothLinkDisconnecting = 3
 };
+enum BluetoothUiAudio {
+  kBluetoothAudioNone = 0,
+  kBluetoothAudioStarting = 1,   // A2DP stream setup.
+  kBluetoothAudioPlaying = 2,
+  kBluetoothAudioPaused = 3,     // The headphones suspended the stream.
+  kBluetoothAudioFailed = 4      // audio_failure says why.
+};
 struct BluetoothUiPaired {
   BYTE address[6];
   char name[64];            // UTF-8; may be empty.
@@ -60,6 +67,9 @@ struct BluetoothUiState {
   DWORD link_failure;       // bt::LinkFailure of the last attempt (0 = ok).
   DWORD link_status;        // HCI status/reason of the last attempt.
   BYTE result_address[6];
+  DWORD audio;              // BluetoothUiAudio for the connected device.
+  DWORD audio_failure;      // bt::A2dpFailure when audio == Failed.
+  DWORD audio_detail;
 };
 BOOL BluetoothGetUiState(BluetoothUiState* state);
 // Starts a ~10 s search ("Pair new device"); the adapter never scans

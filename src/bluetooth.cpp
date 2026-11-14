@@ -10,8 +10,13 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <math.h>
+
+#include "audio.h"
+#include "bt_a2dp.h"
 #include "bt_hci.h"
 #include "bt_link.h"
+#include "bt_sbc.h"
 #include "diagnostics.h"
 #include "xbox_usb_transport.h"
 
@@ -394,6 +399,426 @@ static LinkLog g_link_log;
 static bt::Link g_link(&g_link_log);
 
 // ---------------------------------------------------------------------------
+// A2DP over the ACL bulk endpoints (stage 3). The bulk IN pump and the OUT
+// slots follow the same rules as the event pump: callbacks copy and publish,
+// the worker submits.
+
+const unsigned kAclOutSlots = 3;
+const unsigned kAclOutBytes = 1104;  // HCI ACL header + one L2CAP fragment.
+const DWORD kToneMs = 2000;          // 375 Hz test tone before the system mix.
+const DWORD kStreamLeadMs = 60;      // Send this far ahead of real time.
+const UINT kPcmCushion = 1536;       // Captured frames kept as jitter cushion.
+const UINT kPcmCeiling = 3072;       // Above this, drop back to the cushion.
+
+enum A2dpDiagIndex {
+  kA2Marker = 0,          // 0x55414144 'UAAD'
+  kA2State = 1,
+  kA2InCompletions = 2,
+  kA2InStatus = 3,
+  kA2FramesIn = 4,
+  kA2OutSubmitted = 5,
+  kA2OutCompletions = 6,
+  kA2OutStatus = 7,
+  kA2Credits = 8,
+  kA2MediaPackets = 9,
+  kA2SilentFrames = 10,   // PCM frames padded with silence (underrun).
+  kA2OpenIn = 11,
+  kA2OpenOut = 12,
+  kA2SbcFrames = 13,
+  kA2AclMtu = 14,
+  kA2AclBuffers = 15
+};
+
+}  // namespace
+// Live A2DP counters for XBDM inspection; see A2dpDiagIndex.
+extern "C" volatile DWORD UsbBtA2dp[16] = {0};
+namespace {
+
+static UsbControlTrb g_acl_in_trb;
+static __declspec(align(128)) BYTE g_acl_in_buffer[1024];
+static DWORD g_acl_in_length = 64;
+static UsbControlTrb g_acl_out_trb[kAclOutSlots];
+static __declspec(align(128)) BYTE g_acl_out_buffer[kAclOutSlots][kAclOutBytes];
+static volatile LONG g_acl_in_pending = 0;
+static volatile LONG g_acl_out_pending[kAclOutSlots] = {0, 0, 0};
+static volatile LONG g_acl_fault = 0;
+static volatile LONG g_acl_fault_status = 0;
+static bt::ByteRing<8192> g_acl_bytes;
+static bool g_acl_ready = false;
+static unsigned g_acl_credits = 0;
+static bt::AclAssembler g_acl_assembler;
+static BYTE g_acl_drain[512];
+static BYTE g_tx_frame[1100];
+static unsigned g_tx_length = 0, g_tx_offset = 0;
+
+static bt::SbcEncoder g_sbc;
+static bool g_sbc_ready = false;
+static bool g_a2dp_started = false;
+static bool g_tone_played = false;
+static bool g_pcm_primed = false;
+static DWORD g_stream_start = 0;
+static DWORD g_samples_sent = 0;
+static DWORD g_rtp_timestamp = 0;
+static SHORT g_pcm_frame[128 * 2];
+static SHORT g_pcm_scratch[128 * 2];
+static BYTE g_media[1024];
+static SHORT g_tone[128];
+static DWORD g_audio_ui = kBluetoothAudioNone;
+static DWORD g_audio_failure = 0;
+static DWORD g_audio_detail = 0;
+
+void StreamBegin() {
+  g_stream_start = GetTickCount();
+  g_samples_sent = 0;
+  g_pcm_primed = false;
+  g_sbc.Reset();
+}
+
+class A2dpLog : public bt::A2dpObserver {
+ public:
+  void OnA2dpState(unsigned state) {
+    Log("bt-a2dp %s", bt::A2dpStateName(state));
+    UsbBtA2dp[kA2State] = state;
+    switch (state) {
+      case bt::kA2dpStreaming:
+        g_audio_ui = kBluetoothAudioPlaying;
+        StreamBegin();
+        break;
+      case bt::kA2dpSuspended: g_audio_ui = kBluetoothAudioPaused; break;
+      case bt::kA2dpIdle: g_audio_ui = kBluetoothAudioNone; break;
+      case bt::kA2dpFailed: g_audio_ui = kBluetoothAudioFailed; break;
+      default: g_audio_ui = kBluetoothAudioStarting; break;
+    }
+  }
+  void OnA2dpFailed(unsigned failure, unsigned detail) {
+    Log("bt-a2dp failed reason=%s detail=0x%x", bt::A2dpFailureName(failure),
+        detail);
+    g_audio_ui = kBluetoothAudioFailed;
+    g_audio_failure = failure;
+    g_audio_detail = detail;
+  }
+  void OnA2dpConfigured(const bt::SbcConfig& c) {
+    g_sbc_ready = g_sbc.Configure(c);
+    Log("bt-a2dp sbc freq=%u blocks=%u mode=%u alloc=%u bitpool=%u "
+        "frame=%u ok=%u", c.frequency, c.blocks, c.channel_mode, c.allocation,
+        c.bitpool, g_sbc.frame_length(), g_sbc_ready ? 1u : 0u);
+  }
+};
+
+static A2dpLog g_a2dp_log;
+static bt::A2dpSource g_a2dp(&g_a2dp_log);
+
+void AclStop(const char* what, LONG status) {
+  if (!g_acl_ready) return;
+  g_acl_ready = false;
+  Log("bt-acl stopped: %s status=0x%08x", what, (unsigned)status);
+  if (g_a2dp.state() != bt::kA2dpIdle) {
+    g_audio_ui = kBluetoothAudioFailed;
+    g_audio_failure = 0x20;  // Transport (not a bt::A2dpFailure).
+    g_audio_detail = (DWORD)status;
+  }
+}
+
+void A2dpResetStream() {
+  g_a2dp.Reset();
+  g_acl_assembler.Reset();
+  g_tx_length = g_tx_offset = 0;
+  g_a2dp_started = false;
+  g_sbc_ready = false;
+  g_tone_played = false;
+  g_acl_credits = g_scanner.acl_buffers();
+  g_audio_ui = kBluetoothAudioNone;
+  g_audio_failure = g_audio_detail = 0;
+  UsbBtA2dp[kA2State] = 0;
+}
+
+LONG __cdecl AclInComplete(DWORD transfer, LONG status) {
+  if (transfer != (DWORD)&g_acl_in_trb || !UsbTransportComplete((void*)transfer))
+    return 0;
+  ++UsbBtA2dp[kA2InCompletions];
+  UsbBtA2dp[kA2InStatus] = (DWORD)status;
+  DWORD actual = g_acl_in_trb.actual_length;
+  if ((status != 0 && status != kOhciDataUnderrun) || actual > g_acl_in_length) {
+    g_acl_fault_status = status;
+    InterlockedExchange(&g_acl_fault, 1);
+  } else if (actual) {
+    g_acl_bytes.Write(g_acl_in_buffer, actual);
+  }
+  MemoryBarrier();
+  InterlockedExchange(&g_acl_in_pending, 0);
+  return 0;
+}
+
+LONG __cdecl AclOutComplete(DWORD transfer, LONG status) {
+  for (unsigned i = 0; i < kAclOutSlots; ++i) {
+    if (transfer != (DWORD)&g_acl_out_trb[i]) continue;
+    if (!UsbTransportComplete((void*)transfer)) return 0;
+    ++UsbBtA2dp[kA2OutCompletions];
+    UsbBtA2dp[kA2OutStatus] = (DWORD)status;
+    if (status != 0 && status != kOhciDataUnderrun) {
+      g_acl_fault_status = status;
+      InterlockedExchange(&g_acl_fault, 1);
+    }
+    MemoryBarrier();
+    InterlockedExchange(&g_acl_out_pending[i], 0);
+    return 0;
+  }
+  return 0;
+}
+
+bool QueueAclIn() {
+  UsbControlTrb& t = g_acl_in_trb;
+  t.trb.buffer = g_acl_in_buffer;
+  t.trb.length = g_acl_in_length;
+  t.actual_length = 0;
+  t.trb.flags = 1;
+  t.trb.callback = (DWORD)AclInComplete;
+  t.trb.saved_endpoint = t.trb.endpoint;
+  InterlockedExchange(&g_acl_in_pending, 1);
+  LONG submitted = UsbTransportAsync(g_handle, &t);
+  if (submitted < 0) {
+    InterlockedExchange(&g_acl_in_pending, 0);
+    AclStop("acl-in submit", submitted);
+    return false;
+  }
+  return true;
+}
+
+// Opens both bulk endpoints after the interrupt endpoint (the transport
+// tracks at most three data endpoints, which is exactly what HCI needs).
+// Failure only disables audio; scanning and pairing keep working.
+void OpenAcl(const bt::HciEndpoints& e) {
+  g_acl_ready = false;
+  g_acl_bytes.Clear();
+  g_acl_assembler.Reset();
+  InterlockedExchange(&g_acl_fault, 0);
+  memset(&g_acl_in_trb, 0, sizeof(g_acl_in_trb));
+  memset(g_acl_out_trb, 0, sizeof(g_acl_out_trb));
+  for (unsigned i = 0; i < kAclOutSlots; ++i)
+    InterlockedExchange(&g_acl_out_pending[i], 0);
+  UsbBtA2dp[kA2Marker] = 0x55414144;
+  for (int i = 1; i < 16; ++i) UsbBtA2dp[i] = 0;
+  if (!e.acl_in_address || !e.acl_out_address || !e.acl_in_max_packet ||
+      !e.acl_out_max_packet) {
+    Log("bt-acl no bulk endpoints; audio disabled");
+    return;
+  }
+  Step("open-acl");
+  LONG status = UsbTransportOpen(g_handle, kUsbEndpointBulk, e.acl_in_address,
+                                 e.acl_in_max_packet, 0,
+                                 &g_acl_in_trb.trb.endpoint);
+  UsbBtA2dp[kA2OpenIn] = (DWORD)status;
+  DWORD out_endpoint = 0;
+  LONG out_status = -1;
+  if (status >= 0 && g_acl_in_trb.trb.endpoint) {
+    out_status = UsbTransportOpen(g_handle, kUsbEndpointBulk, e.acl_out_address,
+                                  e.acl_out_max_packet, 0, &out_endpoint);
+  }
+  UsbBtA2dp[kA2OpenOut] = (DWORD)out_status;
+  Log("bt-acl open in=0x%08x/0x%08x out=0x%08x/0x%08x", (unsigned)status,
+      (unsigned)g_acl_in_trb.trb.endpoint, (unsigned)out_status,
+      (unsigned)out_endpoint);
+  if (status < 0 || out_status < 0 || !g_acl_in_trb.trb.endpoint || !out_endpoint)
+    return;
+  for (unsigned i = 0; i < kAclOutSlots; ++i)
+    g_acl_out_trb[i].trb.endpoint = out_endpoint;
+  // One USB packet per IN transfer: an ACL packet that ends exactly on a
+  // packet boundary is then never held back waiting for a short packet.
+  g_acl_in_length = e.acl_in_max_packet;
+  if (g_acl_in_length > sizeof(g_acl_in_buffer)) g_acl_in_length = sizeof(g_acl_in_buffer);
+  g_acl_ready = true;
+  QueueAclIn();
+}
+
+// Number Of Completed Packets (Core Vol 4 Part E 7.7.19) returns ACL credits.
+void OnCompletedPackets(const BYTE* p, unsigned n) {
+  if (n < 3) return;
+  unsigned handles = p[2];
+  for (unsigned i = 0; i < handles && 3 + 4 * i + 4 <= n; ++i) {
+    const BYTE* h = p + 3 + 4 * i;
+    WORD handle = (WORD)((h[0] | (h[1] << 8)) & 0x0FFF);
+    WORD count = (WORD)(h[2] | (h[3] << 8));
+    if (handle == g_link.handle()) g_acl_credits += count;
+  }
+  if (g_acl_credits > g_scanner.acl_buffers()) g_acl_credits = g_scanner.acl_buffers();
+}
+
+void AclDrain(DWORD now) {
+  for (;;) {
+    unsigned n = g_acl_bytes.Read(g_acl_drain, sizeof(g_acl_drain));
+    if (!n) return;
+    unsigned used = 0;
+    while (used < n) {
+      bool complete = false;
+      used += g_acl_assembler.Push(g_acl_drain + used, n - used, &complete);
+      if (!complete) continue;
+      ++UsbBtA2dp[kA2FramesIn];
+      if (g_link.busy() && g_acl_assembler.handle() == g_link.handle())
+        g_a2dp.OnFrame(g_acl_assembler.frame(), g_acl_assembler.frame_length(), now);
+    }
+  }
+}
+
+void AclTransmit() {
+  for (;;) {
+    if (g_tx_offset >= g_tx_length) {
+      if (!g_a2dp.HasOutput()) return;
+      unsigned n = 0;
+      const BYTE* frame = g_a2dp.Output(&n);
+      if (n <= sizeof(g_tx_frame)) {
+        memcpy(g_tx_frame, frame, n);
+        g_tx_length = n;
+        g_tx_offset = 0;
+      }
+      g_a2dp.PopOutput();
+      continue;
+    }
+    if (!g_acl_credits) return;
+    unsigned slot = kAclOutSlots;
+    for (unsigned i = 0; i < kAclOutSlots && slot == kAclOutSlots; ++i)
+      if (!g_acl_out_pending[i]) slot = i;
+    if (slot == kAclOutSlots) return;
+    unsigned mtu = g_scanner.acl_mtu();
+    if (mtu > kAclOutBytes - 4) mtu = kAclOutBytes - 4;
+    unsigned chunk = g_tx_length - g_tx_offset;
+    if (chunk > mtu) chunk = mtu;
+    BYTE* p = g_acl_out_buffer[slot];
+    // Packet boundary: 2 = first flushable fragment, 1 = continuation.
+    WORD header = (WORD)((g_link.handle() & 0x0FFF) |
+                         (g_tx_offset ? 0x1000 : 0x2000));
+    p[0] = (BYTE)header;
+    p[1] = (BYTE)(header >> 8);
+    p[2] = (BYTE)chunk;
+    p[3] = (BYTE)(chunk >> 8);
+    memcpy(p + 4, g_tx_frame + g_tx_offset, chunk);
+    UsbControlTrb& t = g_acl_out_trb[slot];
+    t.trb.buffer = p;
+    t.trb.length = 4 + chunk;
+    t.actual_length = 0;
+    t.trb.flags = 1;
+    t.trb.callback = (DWORD)AclOutComplete;
+    t.trb.saved_endpoint = t.trb.endpoint;
+    InterlockedExchange(&g_acl_out_pending[slot], 1);
+    LONG submitted = UsbTransportAsync(g_handle, &t);
+    if (submitted < 0) {
+      InterlockedExchange(&g_acl_out_pending[slot], 0);
+      AclStop("acl-out submit", submitted);
+      return;
+    }
+    ++UsbBtA2dp[kA2OutSubmitted];
+    --g_acl_credits;
+    g_tx_offset += chunk;
+  }
+}
+
+// One SBC frame of PCM: the test tone first, then the captured system mix.
+void FillPcm(DWORD now) {
+  const unsigned spf = g_sbc.samples_per_frame();
+  if (!g_tone_played && now - g_stream_start < kToneMs) {
+    for (unsigned i = 0; i < spf; ++i)
+      g_pcm_frame[2 * i] = g_pcm_frame[2 * i + 1] = g_tone[i & 127];
+    return;
+  }
+  if (!g_tone_played) {
+    g_tone_played = true;
+    g_pcm_primed = false;
+    AudioDiscardBluetoothPcm();  // The ring holds stale audio from before.
+    Log("bt-a2dp test tone done; streaming console audio");
+  }
+  UINT available = AudioBluetoothPcmAvailable();
+  if (!g_pcm_primed) {
+    if (available < kPcmCushion) {
+      memset(g_pcm_frame, 0, spf * 4);
+      return;
+    }
+    g_pcm_primed = true;
+  }
+  while (available > kPcmCeiling) {
+    UINT drop = available - kPcmCushion;
+    if (drop > 128) drop = 128;
+    AudioReadBluetoothPcm(g_pcm_scratch, drop);
+    available = AudioBluetoothPcmAvailable();
+  }
+  UINT got = AudioReadBluetoothPcm(g_pcm_frame, spf);
+  if (got < spf) {
+    memset(g_pcm_frame + 2 * got, 0, (spf - got) * 4);
+    UsbBtA2dp[kA2SilentFrames] += spf - got;
+    if (!got) g_pcm_primed = false;  // Rebuild the cushion after a gap.
+  }
+}
+
+void StreamAudio(DWORD now) {
+  if (!g_a2dp.streaming() || !g_sbc_ready) return;
+  const unsigned spf = g_sbc.samples_per_frame();
+  const unsigned frame = g_sbc.frame_length();
+  if (!spf || spf > 128 || !frame) return;
+  // Media payload: RTP header (12) + SBC header (1) + frames, limited by the
+  // remote MTU, our buffers and what the controller can hold in flight.
+  unsigned budget = g_a2dp.media_mtu();
+  unsigned acl = g_scanner.acl_mtu() * g_scanner.acl_buffers();
+  if (acl > 4 && acl - 4 < budget) budget = acl - 4;
+  if (budget > sizeof(g_media) + 13) budget = sizeof(g_media) + 13;
+  if (budget < 13 + frame) return;
+  unsigned per = (budget - 13) / frame;
+  if (per > 15) per = 15;
+  DWORD target = (now - g_stream_start + kStreamLeadMs) * 48;
+  if ((LONG)(target - g_samples_sent) > 48 * 300) {
+    // Stalled (flow control or a slow tick): skip ahead instead of bursting.
+    DWORD skip = target - g_samples_sent - 48 * kStreamLeadMs;
+    g_samples_sent += skip;
+    g_rtp_timestamp += skip;
+  }
+  while ((LONG)(target - g_samples_sent) >= (LONG)(per * spf)) {
+    if (g_a2dp.free_slots() < 3) return;  // Keep room for signalling.
+    unsigned bytes = 0;
+    for (unsigned f = 0; f < per; ++f) {
+      FillPcm(now);
+      bytes += g_sbc.Encode(g_pcm_frame, g_media + bytes);
+    }
+    UsbBtA2dp[kA2SbcFrames] += per;
+    if (g_a2dp.SendMedia(g_media, bytes, per, g_rtp_timestamp))
+      ++UsbBtA2dp[kA2MediaPackets];
+    g_rtp_timestamp += per * spf;
+    g_samples_sent += per * spf;
+  }
+}
+
+void AclTick(DWORD now) {
+  if (!g_acl_ready) return;
+  if (g_acl_fault) { AclStop("transfer failed", g_acl_fault_status); return; }
+  if (!g_acl_in_pending) {
+    MemoryBarrier();
+    AclDrain(now);
+    if (!QueueAclIn()) return;
+  }
+  AclDrain(now);
+  if (!g_link.busy()) {
+    if (g_a2dp_started || g_a2dp.state() != bt::kA2dpIdle) A2dpResetStream();
+    g_acl_credits = g_scanner.acl_buffers();
+    return;
+  }
+  if (g_link.state() == bt::kLinkConnected) {
+    if (!g_a2dp_started) {
+      g_a2dp_started = true;
+      bool ok = g_a2dp.Start(now);
+      Log("bt-a2dp start ok=%u acl_mtu=%u acl_buffers=%u", ok ? 1u : 0u,
+          g_scanner.acl_mtu(), g_scanner.acl_buffers());
+    }
+    StreamAudio(now);
+  }
+  AclTransmit();
+  g_a2dp.Tick(now);
+  UsbBtA2dp[kA2Credits] = g_acl_credits;
+  UsbBtA2dp[kA2AclMtu] = g_scanner.acl_mtu();
+  UsbBtA2dp[kA2AclBuffers] = g_scanner.acl_buffers();
+}
+
+bool AudioActive() {
+  return g_acl_ready && g_a2dp.state() != bt::kA2dpIdle &&
+         g_a2dp.state() != bt::kA2dpFailed;
+}
+
+// ---------------------------------------------------------------------------
 // USB-domain callbacks: copy, publish, return.
 
 LONG __cdecl ControlComplete(DWORD transfer, LONG status) {
@@ -521,6 +946,10 @@ void DrainEvents(DWORD now) {
       used += g_assembler.Push(g_drain + used, n - used, &complete);
       if (!complete) continue;
       ++UsbBtDiagnostic[kDiagEventsParsed];
+      if (g_assembler.buffer()[0] == 0x13) {  // ACL credits, not for the link.
+        OnCompletedPackets(g_assembler.buffer(), g_assembler.length());
+        continue;
+      }
       // Setup and searches belong to the scanner; once it is done, the
       // link layer owns the controller.
       if (!g_scanner.finished())
@@ -543,6 +972,8 @@ void StartAttachment() {
   InterlockedExchange(&g_scan_request, 0);
   InterlockedExchange(&g_event_fault, 0);
   g_link.Reset();
+  g_acl_ready = false;
+  A2dpResetStream();
   LoadPaired();
   for (int i = 1; i < 16; ++i) UsbBtDiagnostic[i] = 0;
   Log("bt-adapter attached");
@@ -641,6 +1072,7 @@ void ConfigTick() {
   if (status < 0) { Fail(kErrOpenEvents, status); return; }
   Step("queue-interrupt");
   if (!QueueEvent()) return;
+  OpenAcl(e);
   Step("hci-scan");
   SetPhase(kPhaseScanning);
   // Setup only: the adapter never scans until the Guide asks for it.
@@ -772,6 +1204,7 @@ void FinishedTick() {
     }
   }
   g_link.Tick(now);
+  AclTick(now);
   UsbBtDiagnostic[kDiagUnhandled] =
       g_scanner.unhandled_events() + g_link.unhandled_events();
 }
@@ -796,6 +1229,11 @@ void RearmTick() {
   InterlockedExchange(&g_event_pending, 0);
   InterlockedExchange(&g_removed, 0);
   g_link.Reset();  // The controller and its links are gone.
+  g_acl_ready = false;
+  InterlockedExchange(&g_acl_in_pending, 0);
+  for (unsigned i = 0; i < kAclOutSlots; ++i)
+    InterlockedExchange(&g_acl_out_pending[i], 0);
+  A2dpResetStream();
   SetPhase(kPhaseIdle);
   Log("bt-adapter removed");
 }
@@ -845,6 +1283,11 @@ void PublishUi(bool force) {
     }
     memcpy(n.link_address, g_link.address(), 6);
     n.link_paired_now = g_link.paired_now() ? TRUE : FALSE;
+    if (g_link.state() == bt::kLinkConnected) {
+      n.audio = g_audio_ui;
+      n.audio_failure = g_audio_failure;
+      n.audio_detail = g_audio_detail;
+    }
   }
   n.link_result_count = g_link_result_count;
   n.link_failure = g_link_failure;
@@ -967,6 +1410,8 @@ DWORD WINAPI BluetoothWorker(void*) {
   UsbBtDiagnostic[kDiagMarker] = 0x55414254;
   memset(&g_ui, 0, sizeof(g_ui));
   InitializeCriticalSection(&g_ui_lock);
+  for (int i = 0; i < 128; ++i)  // 375 Hz: exactly one period per SBC frame.
+    g_tone[i] = (SHORT)(8000.0f * sinf(6.2831853f * (float)i / 128.0f));
   MemoryBarrier();
   InterlockedExchange(&g_ui_ready, 1);
   for (;;) {
@@ -974,7 +1419,7 @@ DWORD WINAPI BluetoothWorker(void*) {
     if (!g_paired_loaded && DiagnosticsSettingsPath(g_paired_text, MAX_PATH))
       LoadPaired();
     Tick();
-    Sleep(g_phase == kPhaseScanning || g_phase == kPhaseConfig ||
+    Sleep(AudioActive() || g_phase == kPhaseScanning || g_phase == kPhaseConfig ||
           g_phase == kPhaseConfigHeader || g_phase == kPhaseSetConfig ||
           g_phase == kPhaseGetConfig ? 1 : 20);
   }

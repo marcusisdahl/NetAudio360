@@ -1045,7 +1045,22 @@ void RefreshBluetooth(BluetoothScene* state, bool force) {
         ? L"Paired. Finishing the connection..."
         : L"Connecting... If this is a new device, keep it in pairing mode.");
   } else if (ui.link == kBluetoothLinkConnected) {
-    wcscpy_s(text, L"Connected. Audio over Bluetooth arrives in a later update.");
+    switch (ui.audio) {
+      case kBluetoothAudioPlaying:
+        wcscpy_s(text, L"Playing console audio over Bluetooth.");
+        break;
+      case kBluetoothAudioPaused:
+        wcscpy_s(text, L"Connected. The headphones paused the audio.");
+        break;
+      case kBluetoothAudioFailed:
+        _snwprintf_s(text, _countof(text), _TRUNCATE,
+                     L"Connected, but audio couldn't start (A2DP %u/%X).",
+                     ui.audio_failure, ui.audio_detail);
+        break;
+      default:
+        wcscpy_s(text, L"Connected. Starting audio...");
+        break;
+    }
   } else {
     switch (ui.status) {
       case kBluetoothStarting: wcscpy_s(text, L"Starting the adapter..."); break;
@@ -1109,7 +1124,8 @@ void RefreshBluetooth(BluetoothScene* state, bool force) {
       PairedLabel(ui.paired[i], name, _countof(name));
       LPCWSTR suffix = L"";
       if (ui.link != kBluetoothLinkNone && SameAddress(ui.link_address, ui.paired[i].address)) {
-        suffix = ui.link == kBluetoothLinkConnected ? L"  - Connected"
+        suffix = ui.link == kBluetoothLinkConnected
+                   ? (ui.audio == kBluetoothAudioPlaying ? L"  - Playing" : L"  - Connected")
                : ui.link == kBluetoothLinkDisconnecting ? L"  - Disconnecting..."
                : L"  - Connecting...";
       }

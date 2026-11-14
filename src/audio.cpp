@@ -2000,6 +2000,32 @@ VOID AudioTick(const AudioHostApi* api) {
 #endif
 }
 
+UINT AudioBluetoothPcmAvailable() {
+  if (g_io_handle) return 0;  // A DAC owns the ring.
+  LONG available = g_pcm_write - g_pcm_read;
+  return available > 0 ? (UINT)available : 0;
+}
+
+UINT AudioReadBluetoothPcm(SHORT* out, UINT frames) {
+  if (g_io_handle || !out) return 0;
+  LONG read = g_pcm_read;
+  LONG write = g_pcm_write;
+  LONG available = write - read;
+  if (available <= 0) return 0;
+  if ((UINT)available < frames) frames = (UINT)available;
+  for (UINT i = 0; i < frames; ++i) {
+    const LONG* source = g_pcm_ring[(read + i) & (kPcmRingFrames - 1)];
+    out[2 * i] = (SHORT)(source[0] >> 16);
+    out[2 * i + 1] = (SHORT)(source[1] >> 16);
+  }
+  InterlockedExchange(&g_pcm_read, read + frames);
+  return frames;
+}
+
+VOID AudioDiscardBluetoothPcm() {
+  if (!g_io_handle) InterlockedExchange(&g_pcm_read, g_pcm_write);
+}
+
 VOID AudioDeviceRemoved() {
   AudioStopMicrophoneTest();
   InterlockedExchange(&g_stopping, 1);
