@@ -47,5 +47,8 @@ void DiagnosticsFailure(DWORD error, DWORD stage, DWORD request,
                         const uac::Format& format);
 void DiagnosticsStreaming();
 void DiagnosticsDisconnected();
+// Passive threads only: queues one preformatted line (written as
+// "event=bluetooth <text>"). Returns false when the queue is full.
+bool DiagnosticsText(const char* text);
 void DiagnosticsTick();
 bool DiagnosticsSettingsPath(char* output, DWORD capacity);

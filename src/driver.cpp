@@ -3,6 +3,8 @@
 #include <string.h>
 
 #include "audio.h"
+#include "bluetooth.h"
+#include "bt_hci.h"
 #include "settings.h"
 #include "diagnostics.h"
 #include "guide_ui.h"
@@ -12,6 +14,12 @@
 #include "uac_descriptors.h"
 #include "xbox_usb_transport.h"
 #include "detour.h"
+
+// Stage-1 Bluetooth adapter support (HCI scan). 0 restores the upstream
+// audio-only claim policy exactly.
+#ifndef USB_AUDIO360_BLUETOOTH
+#define USB_AUDIO360_BLUETOOTH 1
+#endif
 
 extern "C" LONG XexGetProcedureAddress(HANDLE module, DWORD ordinal,
                                         PVOID address);
@@ -179,6 +187,7 @@ static DWORD g_displaced_voice_context = 0;
 static DWORD g_displaced_voice_device_id = 0;
 static DriverExtension g_extension;
 static volatile DeviceHandle* g_playback_handle = 0;
+static volatile DeviceHandle* g_bluetooth_handle = 0;
 static usb_transport::DeviceClaimGate g_device_gate;
 static AudioHostApi g_audio_api;
 
@@ -384,6 +393,22 @@ static bool HasSupportedPlayback(const BYTE* configuration) {
   return false;
 }
 
+static bool HasBluetoothHci(const BYTE* configuration) {
+#if USB_AUDIO360_BLUETOOTH
+  if (!configuration || configuration[0] < 9 ||
+      configuration[1] != 2) {
+    return false;
+  }
+  const WORD total = ReadWord(configuration + 2);
+  if (total < configuration[0] || total > 0x400) return false;
+  bt::HciEndpoints endpoints;
+  return bt::FindHciEndpoints(configuration, total, &endpoints);
+#else
+  (void)configuration;
+  return false;
+#endif
+}
+
 static bool ValidateResetRoutine() {
   const volatile DWORD* code = (const volatile DWORD*)kResetRootHubPort;
   return code[0] == 0x7D8802A6 && code[1] == 0x9181FFF8 &&
@@ -412,7 +437,8 @@ static bool PoolContainsOnlyTarget(BYTE* target_pool,
 // intentionally stricter than hotplug: ambiguous mappings or a controller
 // pool shared with any other physical device fail closed.
 static bool ReenumerateBootDevice() {
-  if (g_playback_handle || !g_device_gate.available() ||
+  if (g_playback_handle || g_bluetooth_handle ||
+      !g_device_gate.available() ||
       !ValidateResetRoutine()) {
     return false;
   }
@@ -432,7 +458,8 @@ static bool ReenumerateBootDevice() {
         *(DeviceHandle**)(hcd + 0x48) != root ||
         *(DWORD*)(context + 4) != 0 || *(DWORD*)(context + 8) != 0 ||
         context[0x27A] != controller || context[0x27E] != 0 ||
-        !HasSupportedPlayback(context + 0x60)) {
+        (!HasSupportedPlayback(context + 0x60) &&
+         !HasBluetoothHci(context + 0x60))) {
       continue;
     }
 
@@ -513,15 +540,42 @@ static bool ProfileForHandle(DeviceHandle* handle, AudioProfile* profile,
   return true;
 }
 
+// Primary HCI interface of a USB Bluetooth adapter (Core Vol 4 Part B):
+// class E0/01/01, alternate 0, interrupt IN + bulk IN + bulk OUT. Matched by
+// class only. The SCO interface (isochronous endpoints) is left unclaimed.
+static bool BluetoothInterfaceForHandle(DeviceHandle* handle,
+                                        BYTE* interface_number,
+                                        BYTE* rejection) {
+  *rejection = 0;
+  UsbInterfaceDescriptor* d =
+      handle && g_get_interface_descriptor
+          ? g_get_interface_descriptor(handle) : 0;
+  if (!d || d->interface_class != 0xE0) return false;
+  if (!USB_AUDIO360_BLUETOOTH) { *rejection = 10; return false; }
+  if (d->interface_subclass != 0x01 || d->interface_protocol != 0x01 ||
+      d->alternate_setting != 0 || d->endpoint_count != 3) {
+    *rejection = 9;
+    return false;
+  }
+  DWORD controller = *((BYTE*)handle + 8) & 3;
+  BYTE* hcd = ((BYTE**)kUsbHcdTable)[controller];
+  if (!hcd) { *rejection = 7; return false; }
+  if (!(hcd[0x96] & 2)) { *rejection = 8; return false; }
+  *interface_number = d->interface_number;
+  return true;
+}
+
 static void RecordDevice(DeviceHandle* handle, int status,
                          UsbAudioDeviceDecision decision, BYTE rejection) {
   UsbInterfaceDescriptor* interface_descriptor =
       handle && g_get_interface_descriptor
           ? g_get_interface_descriptor(handle) : 0;
-  // Only AudioStreaming interfaces are relevant. Avoid filling the bounded
-  // queue with unrelated failed USB interfaces on composite devices.
-  if (!interface_descriptor || interface_descriptor->interface_class != 1 ||
-      interface_descriptor->interface_subclass != 2) return;
+  // Only AudioStreaming and Bluetooth (wireless controller) interfaces are
+  // relevant. Avoid filling the bounded queue with unrelated interfaces.
+  if (!interface_descriptor ||
+      ((interface_descriptor->interface_class != 1 ||
+        interface_descriptor->interface_subclass != 2) &&
+       interface_descriptor->interface_class != 0xE0)) return;
   UsbDeviceDescriptor* device_descriptor =
       handle && g_get_device_descriptor ? g_get_device_descriptor(handle) : 0;
   UsbAudioDeviceObservation observation;
@@ -557,15 +611,26 @@ static int AddDeviceCompleteHook(DeviceHandle* handle, int status) {
 
   AudioProfile profile;
   BYTE rejection = 0;
+  usb_transport::DeviceClaimGate::Kind kind =
+      usb_transport::DeviceClaimGate::kAudio;
+  BYTE bluetooth_interface = 0;
   if (!ProfileForHandle(handle, &profile, &rejection)) {
-    RecordDevice(handle, status, kDeviceRejectedProfile, rejection);
-    return g_add_detour.Original<AddDeviceCompleteFn>()(handle, status);
+    BYTE bluetooth_rejection = 0;
+    if (rejection == 4 &&
+        BluetoothInterfaceForHandle(handle, &bluetooth_interface,
+                                    &bluetooth_rejection)) {
+      kind = usb_transport::DeviceClaimGate::kBluetooth;
+    } else {
+      RecordDevice(handle, status, kDeviceRejectedProfile,
+                   bluetooth_rejection ? bluetooth_rejection : rejection);
+      return g_add_detour.Original<AddDeviceCompleteFn>()(handle, status);
+    }
   }
   if (!g_device_gate.available()) {
     RecordDevice(handle, status, kDeviceSlotBusy, 0);
     return g_add_detour.Original<AddDeviceCompleteFn>()(handle, status);
   }
-  if (!g_device_gate.Activate(handle)) {
+  if (!g_device_gate.Activate(handle, kind)) {
     RecordDevice(handle, status, kDeviceSlotBusy, 0);
     return g_add_detour.Original<AddDeviceCompleteFn>()(handle, status);
   }
@@ -575,6 +640,17 @@ static int AddDeviceCompleteHook(DeviceHandle* handle, int status) {
     return g_add_detour.Original<AddDeviceCompleteFn>()(handle, status);
   }
   RecordDevice(handle, status, kDeviceClaimed, 0);
+  if (kind == usb_transport::DeviceClaimGate::kBluetooth) {
+    memset(&g_extension, 0, sizeof(g_extension));
+    g_extension.device_handle = handle;
+    g_extension.interface_number = bluetooth_interface;
+    g_extension.interrupt_trb.flags = 1;
+    handle->driver = &g_extension;
+    InterlockedExchange((volatile LONG*)&g_bluetooth_handle, (LONG)handle);
+    BluetoothDeviceAttached(handle);
+    // Same completion contract as the audio claim below.
+    return g_add_detour.Original<AddDeviceCompleteFn>()(handle, 0);
+  }
   UsbAudioDiagnostic[0] = profile.audio_class_version;
   memset(&g_extension, 0, sizeof(g_extension));
   g_extension.device_handle = handle;
@@ -608,12 +684,20 @@ static void DeviceRearmComplete() {
 
 static LONG RemoveDeviceCompleteHook(DeviceHandle* handle) {
   if (handle && g_device_gate.BeginRemoval(handle)) {
+    const bool bluetooth =
+        g_device_gate.kind() == usb_transport::DeviceClaimGate::kBluetooth;
     UsbRemoveCompleteRoutine remove_complete =
         (UsbRemoveCompleteRoutine)
             g_remove_detour.Original<RemoveDeviceCompleteFn>();
     UsbTransportDetach(handle, remove_complete, DeviceRearmComplete);
-    InterlockedExchange((volatile LONG*)&g_playback_handle, 0);
-    AudioDeviceRemoved();
+    if (bluetooth) {
+      // The Bluetooth worker drives the re-arm, like AudioTick does.
+      InterlockedExchange((volatile LONG*)&g_bluetooth_handle, 0);
+      BluetoothDeviceRemoved();
+    } else {
+      InterlockedExchange((volatile LONG*)&g_playback_handle, 0);
+      AudioDeviceRemoved();
+    }
     return 0;
   }
   return g_remove_detour.Original<RemoveDeviceCompleteFn>()(handle);
@@ -750,6 +834,9 @@ extern "C" BOOL APIENTRY DllMain(HANDLE module, DWORD reason, LPVOID) {
   }
   StartWorker((LPTHREAD_START_ROUTINE)NotificationWorker,
               THREAD_PRIORITY_BELOW_NORMAL, true);
+#if USB_AUDIO360_BLUETOOTH
+  StartWorker(BluetoothWorker, THREAD_PRIORITY_NORMAL, false);
+#endif
   RemoteVolumeInitialize(kernel);
   return TRUE;
 }

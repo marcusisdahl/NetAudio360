@@ -35,6 +35,7 @@ enum EventType {
   kEventFailure = 5,
   kEventStreaming = 6,
   kEventDisconnected = 7,
+  kEventText = 8,
 };
 
 struct Event {
@@ -89,9 +90,10 @@ struct LoaderEntryPrefix {
 typedef char RequireLoaderNameAt24[
     offsetof(LoaderEntryPrefix, full_name) == 0x24 ? 1 : -1];
 
-static void Queue(DWORD type, const DWORD* values, unsigned value_count,
-                  const void* payload, DWORD payload_length) {
-  if (!g_initialized) return;
+static bool Queue(DWORD type, const DWORD* values, unsigned value_count,
+                  const void* payload, DWORD payload_length,
+                  bool count_drop = true) {
+  if (!g_initialized) return false;
   if (value_count > kValueCount) value_count = kValueCount;
   if (payload_length > kPayloadBytes) payload_length = kPayloadBytes;
   LONG start = InterlockedIncrement(&g_next_slot) - 1;
@@ -107,9 +109,10 @@ static void Queue(DWORD type, const DWORD* values, unsigned value_count,
     if (payload && payload_length)
       memcpy(slot.event.payload, payload, payload_length);
     InterlockedExchange(&slot.state, 1);
-    return;
+    return true;
   }
-  InterlockedIncrement(&g_dropped);
+  if (count_drop) InterlockedIncrement(&g_dropped);
+  return false;
 }
 
 static void RotateIfNeeded() {
@@ -152,6 +155,8 @@ static const char* RejectionName(DWORD rejection) {
     case 6: return "unsupported-uac-protocol";
     case 7: return "missing-controller";
     case 8: return "not-full-speed-ohci";
+    case 9: return "bluetooth-secondary-interface";
+    case 10: return "bluetooth-disabled";
     default: return "unknown";
   }
 }
@@ -251,6 +256,10 @@ static void WriteEvent(FILE* file, const Event& event) {
       break;
     case kEventDisconnected:
       fprintf(file, "tick=%lu event=disconnected\n", event.tick);
+      break;
+    case kEventText:
+      fprintf(file, "tick=%lu event=bluetooth %.*s\n", event.tick,
+              (int)event.payload_length, (const char*)event.payload);
       break;
   }
 }
@@ -385,6 +394,12 @@ void DiagnosticsFailure(DWORD error, DWORD stage, DWORD request,
 
 void DiagnosticsStreaming() { Queue(kEventStreaming, 0, 0, 0, 0); }
 void DiagnosticsDisconnected() { Queue(kEventDisconnected, 0, 0, 0, 0); }
+
+bool DiagnosticsText(const char* text) {
+  if (!text) return false;
+  // Not counted as a drop: callers retry while the queue is full.
+  return Queue(kEventText, 0, 0, text, (DWORD)strlen(text), false);
+}
 
 void DiagnosticsTick() {
   if (!g_initialized) return;

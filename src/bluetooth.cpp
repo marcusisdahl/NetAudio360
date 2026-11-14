@@ -1,0 +1,523 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Xbox side of the Bluetooth adapter: USB setup, the interrupt-IN event pump
+// and the command path, driving the portable bt::Scanner. Every raw USB
+// operation goes through xbox_usb_transport (USB DPC domain). Completion
+// callbacks only copy results and publish them; all submission, including
+// requeueing the event transfer, runs on this worker, as audio.cpp does.
+#include "bluetooth.h"
+
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "bt_hci.h"
+#include "diagnostics.h"
+#include "xbox_usb_transport.h"
+
+// Live counters for XBDM/debug inspection; see the index list below.
+extern "C" volatile DWORD UsbBtDiagnostic[16] = {0};
+
+namespace {
+
+enum DiagnosticIndex {
+  kDiagMarker = 0,          // 0x55414254 'UABT'
+  kDiagPhase = 1,
+  kDiagScanStage = 2,
+  kDiagEventCompletions = 3,
+  kDiagEventStatus = 4,
+  kDiagEventActual = 5,     // Raw TRB + 0x1c after the last completion.
+  kDiagEventLength = 6,     // Raw TRB + 0x18 after the last completion.
+  kDiagRingDrops = 7,
+  kDiagEventsParsed = 8,
+  kDiagCommandsSent = 9,
+  kDiagControlStatus = 10,
+  kDiagError = 11,
+  kDiagDevices = 12,
+  kDiagOpenStatus = 13,     // Interrupt endpoint open result.
+  kDiagUnhandled = 14,
+  kDiagEventRejects = 15    // Completions with an unusable status/length.
+};
+
+const DWORD kControlDeadlineMs = 5000;  // Linux USB_CTRL_*_TIMEOUT.
+const DWORD kRemovalSettleMs = 1000;
+const DWORD kRearmRetryMs = 250;
+const DWORD kRearmDeadlineMs = 5000;
+const LONG kOhciDataUnderrun = (LONG)0xc0050003;
+
+enum Phase {
+  kPhaseIdle = 0,
+  kPhaseConfigHeader = 1,
+  kPhaseConfig = 2,
+  kPhaseScanning = 3,
+  kPhaseFinished = 4,
+  kPhaseFailed = 5,   // Stopped; storage retained until removal drains.
+  kPhaseRearm = 6
+};
+
+enum Error {
+  kErrNone = 0,
+  kErrOpenDefault = 0xb001,
+  kErrControlSubmit = 0xb002,
+  kErrControlTimeout = 0xb003,
+  kErrControlStatus = 0xb004,
+  kErrDescriptor = 0xb005,
+  kErrOpenEvents = 0xb006,
+  kErrEventSubmit = 0xb007,
+  kErrEventStatus = 0xb008,
+  kErrScan = 0xb009,
+  kErrRearm = 0xb00a
+};
+
+// Kernel transfer request layout shared with audio.cpp. The kernel's async
+// queue initialises and accumulates the completed byte count at +0x1c; for
+// interrupt transfers this is verified by the first hardware run (see
+// kDiagEventActual / kDiagEventLength), so the event TRB reserves the same
+// storage as a control TRB.
+struct UsbTrb {
+  DWORD endpoint;
+  DWORD callback;
+  DWORD saved_endpoint;
+  BYTE padding[4];
+  BYTE flags;
+  BYTE controller_index;
+  BYTE pad2;
+  BYTE endpoint_index;
+  void* buffer;
+  DWORD length;
+};
+struct UsbPacket {
+  BYTE request_type;
+  BYTE request;
+  WORD value;
+  WORD index;
+  WORD length;
+};
+struct UsbControlTrb {
+  UsbTrb trb;
+  DWORD actual_length;
+  UsbPacket packet;
+};
+typedef char BtActualOffset[offsetof(UsbControlTrb, actual_length) == 0x1c ? 1 : -1];
+typedef char BtSetupOffset[offsetof(UsbControlTrb, packet) == 0x20 ? 1 : -1];
+
+static UsbControlTrb g_control;
+static UsbControlTrb g_event_trb;
+static __declspec(align(128)) BYTE g_control_buffer[0x200];
+static __declspec(align(128)) BYTE g_event_buffer[64];
+static bt::ByteRing<4096> g_events;
+
+// Published by the USB domain.
+static void* volatile g_attached_handle = 0;
+static volatile LONG g_removed = 0;
+static volatile DWORD g_removed_at = 0;
+static volatile LONG g_control_done = 0;
+static volatile LONG g_control_status = 0;
+static volatile DWORD g_control_actual = 0;
+static volatile LONG g_event_pending = 0;
+static volatile LONG g_event_fault = 0;
+static volatile LONG g_event_fault_status = 0;
+
+// Worker-owned.
+static void* g_handle = 0;
+static Phase g_phase = kPhaseIdle;
+static bool g_control_pending = false;
+static DWORD g_control_issued = 0;
+static DWORD g_rearm_last_attempt = 0;
+static bt::HciEndpoints g_endpoints;
+static DWORD g_event_length = 0;
+static bt::EventAssembler g_assembler;
+static BYTE g_drain[256];
+
+void SetPhase(Phase phase) {
+  g_phase = phase;
+  UsbBtDiagnostic[kDiagPhase] = phase;
+}
+
+WORD Swap16(WORD v) { return (WORD)((v >> 8) | (v << 8)); }
+
+// Formatting happens here on the passive worker; the diagnostics queue
+// only copies. Briefly waits for a free slot rather than dropping lines.
+void Log(const char* format, ...) {
+  char line[320];
+  va_list args;
+  va_start(args, format);
+  int n = _vsnprintf(line, sizeof(line) - 1, format, args);
+  va_end(args);
+  if (n < 0) n = sizeof(line) - 1;
+  line[n] = 0;
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    if (DiagnosticsText(line)) return;
+    Sleep(10);
+  }
+}
+
+void Fail(Error error, LONG status) {
+  UsbBtDiagnostic[kDiagError] = error;
+  Log("bt-error code=0x%04x status=0x%08lx phase=%u", error, (DWORD)status,
+      (unsigned)g_phase);
+  SetPhase(kPhaseFailed);
+}
+
+const char* MajorClass(DWORD cod) {
+  static const char* names[] = {
+    "misc", "computer", "phone", "network", "audio/video", "peripheral",
+    "imaging", "wearable", "toy", "health"
+  };
+  DWORD major = (cod >> 8) & 0x1F;
+  return major < sizeof(names) / sizeof(names[0]) ? names[major] : "other";
+}
+
+// Log-safe copy: control characters become '?'; UTF-8 passes through.
+void Printable(const char* in, char* out, size_t capacity) {
+  size_t i = 0;
+  for (; in[i] && i + 1 < capacity; ++i)
+    out[i] = (unsigned char)in[i] < 0x20 || in[i] == 0x7F ? '?' : in[i];
+  out[i] = 0;
+}
+
+class LogObserver : public bt::ScanObserver {
+ public:
+  void OnLocalVersion(const bt::LocalVersion& v) {
+    Log("bt-local hci=%u rev=0x%04x lmp=%u subver=0x%04x manufacturer=%u%s",
+        v.hci_version, v.hci_revision, v.lmp_version, v.lmp_subversion,
+        v.manufacturer, v.manufacturer == 10 ? " (CSR)" : "");
+  }
+  void OnLocalAddress(const bt::u8* address) {
+    char text[18];
+    bt::FormatAddress(address, text);
+    Log("bt-local bd_addr=%s", text);
+  }
+  void OnInquiryStarted(unsigned duration_ms) {
+    Log("bt-inquiry start duration_ms=%u", duration_ms);
+  }
+  void OnDeviceFound(const bt::Device& d) { Write("bt-found", d); }
+  void OnDeviceNamed(const bt::Device& d) { Write("bt-named", d); }
+  void OnWarning(unsigned stage, bt::u16 opcode, bt::u8 status) {
+    Log("bt-warning stage=%s opcode=0x%04x status=0x%02x",
+        bt::StageName(stage), opcode, status);
+  }
+  void OnComplete(const bt::Device* devices, unsigned count) {
+    unsigned named = 0;
+    for (unsigned i = 0; i < count; ++i)
+      if (devices[i].name[0]) ++named;
+    Log("bt-inquiry complete devices=%u named=%u", count, named);
+    for (unsigned i = 0; i < count; ++i) Write("bt-device", devices[i]);
+  }
+  void OnFailed(unsigned stage, unsigned failure, bt::u16 opcode,
+                bt::u8 status) {
+    Log("bt-scan failed stage=%s reason=%s opcode=0x%04x status=0x%02x",
+        bt::StageName(stage), bt::FailureName(failure), opcode, status);
+  }
+
+ private:
+  static void Write(const char* tag, const bt::Device& d) {
+    char address[18];
+    char name[bt::kMaxNameBytes];
+    bt::FormatAddress(d.address, address);
+    Printable(d.name, name, sizeof(name));
+    char rssi[16] = "n/a";
+    if (d.has_rssi) _snprintf(rssi, sizeof(rssi) - 1, "%d", (int)d.rssi);
+    Log("%s addr=%s cod=0x%06lx (%s) rssi=%s name=\"%s\"", tag, address,
+        (DWORD)d.class_of_device, MajorClass(d.class_of_device), rssi, name);
+  }
+};
+
+static LogObserver g_observer;
+static bt::Scanner g_scanner(&g_observer);
+
+// ---------------------------------------------------------------------------
+// USB-domain callbacks: copy, publish, return.
+
+LONG __cdecl ControlComplete(DWORD transfer, LONG status) {
+  if (transfer != (DWORD)&g_control || !UsbTransportComplete((void*)transfer))
+    return 0;
+  g_control_actual = g_control.actual_length;
+  g_control_status = status;
+  MemoryBarrier();
+  InterlockedExchange(&g_control_done, 1);
+  return 0;
+}
+
+LONG __cdecl EventComplete(DWORD transfer, LONG status) {
+  if (transfer != (DWORD)&g_event_trb || !UsbTransportComplete((void*)transfer))
+    return 0;
+  ++UsbBtDiagnostic[kDiagEventCompletions];
+  UsbBtDiagnostic[kDiagEventStatus] = (DWORD)status;
+  UsbBtDiagnostic[kDiagEventActual] = g_event_trb.actual_length;
+  UsbBtDiagnostic[kDiagEventLength] = g_event_trb.trb.length;
+  DWORD actual = g_event_trb.actual_length;
+  // Short interrupt IN is normal for HCI events. Only success and OHCI
+  // DataUnderrun (short packet) are accepted; anything else stops the pump.
+  if ((status != 0 && status != kOhciDataUnderrun) || actual > g_event_length) {
+    ++UsbBtDiagnostic[kDiagEventRejects];
+    g_event_fault_status = status;
+    InterlockedExchange(&g_event_fault, 1);
+  } else if (actual && !g_events.Write(g_event_buffer, actual)) {
+    UsbBtDiagnostic[kDiagRingDrops] = g_events.dropped();
+  }
+  MemoryBarrier();
+  InterlockedExchange(&g_event_pending, 0);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Worker-side submission.
+
+bool QueueControl(BYTE type, BYTE request, WORD value, WORD index,
+                  WORD length) {
+  if (g_control_pending || length > sizeof(g_control_buffer)) return false;
+  g_control.packet.request_type = type;
+  g_control.packet.request = request;
+  g_control.packet.value = Swap16(value);
+  g_control.packet.index = Swap16(index);
+  g_control.packet.length = Swap16(length);
+  g_control.trb.buffer = g_control_buffer;
+  g_control.trb.length = length;
+  g_control.actual_length = 0;
+  g_control.trb.flags = 1;  // Accept short IN; actual length validated.
+  g_control.trb.callback = (DWORD)ControlComplete;
+  g_control.trb.saved_endpoint = g_control.trb.endpoint;
+  InterlockedExchange(&g_control_done, 0);
+  g_control_pending = true;
+  g_control_issued = GetTickCount();
+  LONG submitted = UsbTransportControl(g_handle, &g_control);
+  if (submitted < 0) {
+    // Not accepted by the adapter: ownership was never taken.
+    g_control_pending = false;
+    Fail(kErrControlSubmit, submitted);
+    return false;
+  }
+  return true;
+}
+
+// Returns 1 when the pending control transfer completed successfully,
+// 0 while pending, -1 after failure (phase is already Failed).
+int PollControl(DWORD* actual) {
+  if (!g_control_pending) return -1;
+  if (!g_control_done) {
+    if (GetTickCount() - g_control_issued >= kControlDeadlineMs) {
+      // Storage stays owned by the host; this attachment never reuses it.
+      Fail(kErrControlTimeout, 0);
+    }
+    return g_phase == kPhaseFailed ? -1 : 0;
+  }
+  MemoryBarrier();
+  g_control_pending = false;
+  LONG status = g_control_status;
+  UsbBtDiagnostic[kDiagControlStatus] = (DWORD)status;
+  if (status != 0 && status != kOhciDataUnderrun) {
+    Fail(kErrControlStatus, status);
+    return -1;
+  }
+  DWORD n = g_control_actual;
+  if (n > g_control.trb.length) {
+    Fail(kErrControlStatus, (LONG)n);
+    return -1;
+  }
+  if (actual) *actual = n;
+  return 1;
+}
+
+bool QueueEvent() {
+  g_event_trb.trb.buffer = g_event_buffer;
+  g_event_trb.trb.length = g_event_length;
+  g_event_trb.actual_length = 0;
+  g_event_trb.trb.flags = 1;
+  g_event_trb.trb.callback = (DWORD)EventComplete;
+  g_event_trb.trb.saved_endpoint = g_event_trb.trb.endpoint;
+  InterlockedExchange(&g_event_pending, 1);
+  LONG submitted = UsbTransportAsync(g_handle, &g_event_trb);
+  if (submitted < 0) {
+    InterlockedExchange(&g_event_pending, 0);
+    Fail(kErrEventSubmit, submitted);
+    return false;
+  }
+  return true;
+}
+
+void DrainEvents(DWORD now) {
+  for (;;) {
+    unsigned n = g_events.Read(g_drain, sizeof(g_drain));
+    if (!n) return;
+    size_t used = 0;
+    while (used < n) {
+      bool complete = false;
+      used += g_assembler.Push(g_drain + used, n - used, &complete);
+      if (!complete) continue;
+      ++UsbBtDiagnostic[kDiagEventsParsed];
+      g_scanner.OnEvent(g_assembler.buffer(), g_assembler.length(), now);
+    }
+  }
+}
+
+void StartAttachment() {
+  g_handle = g_attached_handle;
+  memset(&g_control, 0, sizeof(g_control));
+  memset(&g_event_trb, 0, sizeof(g_event_trb));
+  memset(&g_endpoints, 0, sizeof(g_endpoints));
+  g_events.Clear();
+  g_assembler.Reset();
+  g_control_pending = false;
+  InterlockedExchange(&g_event_fault, 0);
+  for (int i = 1; i < 16; ++i) UsbBtDiagnostic[i] = 0;
+  Log("bt-adapter attached");
+  LONG status = UsbTransportOpenDefault(g_handle, &g_control.trb.endpoint);
+  if (status < 0) { Fail(kErrOpenDefault, status); return; }
+  SetPhase(kPhaseConfigHeader);
+  QueueControl(0x80, 6, 0x0200, 0, 9);  // GET_DESCRIPTOR(configuration)
+}
+
+void ConfigTick() {
+  DWORD actual = 0;
+  if (PollControl(&actual) <= 0) return;
+  if (g_phase == kPhaseConfigHeader) {
+    if (actual < 4 || g_control_buffer[1] != 2) { Fail(kErrDescriptor, actual); return; }
+    WORD total = (WORD)(g_control_buffer[2] | (g_control_buffer[3] << 8));
+    if (total < 9) { Fail(kErrDescriptor, total); return; }
+    if (total > sizeof(g_control_buffer)) total = sizeof(g_control_buffer);
+    SetPhase(kPhaseConfig);
+    QueueControl(0x80, 6, 0x0200, 0, total);
+    return;
+  }
+  if (!bt::FindHciEndpoints(g_control_buffer, actual, &g_endpoints)) {
+    Fail(kErrDescriptor, actual);
+    return;
+  }
+  const bt::HciEndpoints& e = g_endpoints;
+  Log("bt-adapter interface=%u event=0x%02x/%u/interval%u acl_in=0x%02x/%u "
+      "acl_out=0x%02x/%u", e.interface_number, e.event_address,
+      e.event_max_packet, e.event_interval, e.acl_in_address,
+      e.acl_in_max_packet, e.acl_out_address, e.acl_out_max_packet);
+  g_event_length = e.event_max_packet;
+  if (g_event_length > sizeof(g_event_buffer)) g_event_length = sizeof(g_event_buffer);
+  LONG status = UsbTransportOpen(g_handle, kUsbEndpointInterrupt,
+                                 e.event_address, e.event_max_packet,
+                                 e.event_interval ? e.event_interval : 1,
+                                 &g_event_trb.trb.endpoint);
+  UsbBtDiagnostic[kDiagOpenStatus] = (DWORD)status;
+  if (status < 0) { Fail(kErrOpenEvents, status); return; }
+  if (!QueueEvent()) return;
+  SetPhase(kPhaseScanning);
+  g_scanner.Start(GetTickCount());
+}
+
+void ScanTick() {
+  DWORD now = GetTickCount();
+  if (g_event_fault) { Fail(kErrEventStatus, g_event_fault_status); return; }
+  // Events first so a Command Complete that raced the control completion is
+  // seen before the next command is considered.
+  if (!g_event_pending) {
+    MemoryBarrier();
+    DrainEvents(now);
+    if (!QueueEvent()) return;
+  }
+  DrainEvents(now);
+  if (g_control_pending) {
+    int result = PollControl(0);
+    if (result < 0) { g_scanner.Abort(bt::kFailTransport, 0); return; }
+  }
+  if (!g_control_pending) {
+    BYTE command[bt::kMaxCommandBytes];
+    unsigned n = g_scanner.NextCommand(command, sizeof(command));
+    if (n) {
+      memcpy(g_control_buffer, command, n);
+      // HCI command: class request to the device (Core Vol 4 Part B 2.2).
+      if (!QueueControl(0x20, 0, 0, 0, (WORD)n)) {
+        g_scanner.Abort(bt::kFailTransport, 0);
+        return;
+      }
+      g_scanner.CommandSent(now);
+      ++UsbBtDiagnostic[kDiagCommandsSent];
+    }
+  }
+  g_scanner.Tick(now);
+  UsbBtDiagnostic[kDiagScanStage] = g_scanner.stage();
+  UsbBtDiagnostic[kDiagDevices] = g_scanner.device_count();
+  UsbBtDiagnostic[kDiagUnhandled] = g_scanner.unhandled_events();
+  UsbBtDiagnostic[kDiagRingDrops] = g_events.dropped();
+  if (g_scanner.stage() == bt::kStageDone) SetPhase(kPhaseFinished);
+  else if (g_scanner.stage() == bt::kStageFailed) Fail(kErrScan, 0);
+}
+
+void FinishedTick() {
+  // Keep the event pipe serviced so the controller is never left with
+  // undelivered events; nothing else is submitted.
+  if (g_event_fault) { Fail(kErrEventStatus, g_event_fault_status); return; }
+  if (!g_event_pending) {
+    MemoryBarrier();
+    g_events.Clear();
+    QueueEvent();
+  }
+}
+
+void RearmTick() {
+  DWORD now = GetTickCount();
+  DWORD elapsed = now - g_removed_at;
+  if (elapsed < kRemovalSettleMs) return;
+  if (elapsed >= kRearmDeadlineMs) {
+    // Fail closed: storage stays retained and the claim stays draining.
+    if (UsbBtDiagnostic[kDiagError] != kErrRearm) {
+      UsbBtDiagnostic[kDiagError] = kErrRearm;
+      Log("bt-error code=0x%04x drain/re-arm deadline", kErrRearm);
+    }
+    return;
+  }
+  if (now - g_rearm_last_attempt < kRearmRetryMs) return;
+  g_rearm_last_attempt = now;
+  if (!UsbTransportRearm()) return;
+  g_handle = 0;
+  g_control_pending = false;
+  InterlockedExchange(&g_event_pending, 0);
+  InterlockedExchange(&g_removed, 0);
+  SetPhase(kPhaseIdle);
+  Log("bt-adapter removed");
+}
+
+void Tick() {
+  if (g_removed && g_phase != kPhaseRearm) {
+    g_rearm_last_attempt = g_removed_at;
+    SetPhase(kPhaseRearm);
+  }
+  switch (g_phase) {
+    case kPhaseIdle:
+      if (g_attached_handle && !g_removed) StartAttachment();
+      break;
+    case kPhaseConfigHeader:
+    case kPhaseConfig:
+      ConfigTick();
+      break;
+    case kPhaseScanning:
+      ScanTick();
+      break;
+    case kPhaseFinished:
+      FinishedTick();
+      break;
+    case kPhaseRearm:
+      RearmTick();
+      break;
+    case kPhaseFailed:
+      break;
+  }
+}
+
+}  // namespace
+
+VOID BluetoothDeviceAttached(void* handle) {
+  g_attached_handle = handle;
+}
+
+VOID BluetoothDeviceRemoved() {
+  g_attached_handle = 0;
+  g_removed_at = GetTickCount();
+  MemoryBarrier();
+  InterlockedExchange(&g_removed, 1);
+}
+
+DWORD WINAPI BluetoothWorker(void*) {
+  UsbBtDiagnostic[kDiagMarker] = 0x55414254;
+  for (;;) {
+    Tick();
+    Sleep(g_phase == kPhaseScanning || g_phase == kPhaseConfig ||
+          g_phase == kPhaseConfigHeader ? 1 : 20);
+  }
+}

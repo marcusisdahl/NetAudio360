@@ -1251,7 +1251,7 @@ static void EndpointOpenTick() {
   if (g_endpoint_phase == 1) {
     UsbAudioDiagnostic[55] = 3;  // Before opening OUT.
     status = UsbTransportOpen(
-        g_io_handle, g_profile.endpoint_address,
+        g_io_handle, kUsbEndpointIsoch, g_profile.endpoint_address,
         g_profile.endpoint_packet_size, 1, (DWORD*)&g_isoch[0]);
     UsbAudioDiagnostic[11] = status;
     if (status < 0) { SetupFailed(status); return; }
@@ -1261,14 +1261,14 @@ static void EndpointOpenTick() {
     if (g_format.feedback.address) {
       UsbAudioDiagnostic[55] = 5;  // Before opening feedback IN.
       status = UsbTransportOpen(
-          g_io_handle, g_profile.feedback_endpoint_address,
+          g_io_handle, kUsbEndpointIsoch, g_profile.feedback_endpoint_address,
           g_profile.feedback_endpoint_packet_size, 1, (DWORD*)&g_feedback_isoch[0]);
       UsbAudioDiagnostic[12] = status;
       if (status < 0) { SetupFailed(status); return; }
     }
     if (g_capture_supported) {
       status = UsbTransportOpen(
-          g_io_handle, g_capture_format.data.address,
+          g_io_handle, kUsbEndpointIsoch, g_capture_format.data.address,
           g_capture_format.data.max_packet_bytes, 1,
           (DWORD*)&g_mic_isoch[0]);
       if (status < 0) g_capture_supported = false;

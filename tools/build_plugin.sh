@@ -134,6 +134,10 @@ cp "$project_root/src/mic_test.h" "$build_dir/mic_test.h"
 cp "$project_root/src/usb_strings.h" "$build_dir/usb_strings.h"
 cp "$project_root/src/mic_packet_policy.h" "$build_dir/mic_packet_policy.h"
 cp "$project_root/src/debug_command.h" "$build_dir/debug_command.h"
+cp "$project_root/src/bluetooth.cpp" "$build_dir/bluetooth.cpp"
+cp "$project_root/src/bluetooth.h" "$build_dir/bluetooth.h"
+cp "$project_root/src/bt_hci.cpp" "$build_dir/bt_hci.cpp"
+cp "$project_root/src/bt_hci.h" "$build_dir/bt_hci.h"
 cp "$project_root/src/detour.cpp" "$build_dir/detour.cpp"
 cp "$project_root/src/detour.h" "$build_dir/detour.h"
 cp "$project_root/src/xex.xml" "$build_dir/xex.xml"
@@ -165,6 +169,8 @@ compile xbox_usb_transport.cpp xbox_usb_transport.obj
 compile uac_descriptors.cpp uac_descriptors.obj
 compile uac_clock.cpp uac_clock.obj
 compile detour.cpp detour.obj
+compile bluetooth.cpp bluetooth.obj
+compile bt_hci.cpp bt_hci.obj
 
 link_command="set TMP=$wine_build\\tmp&& set TEMP=$wine_build\\tmp&& "
 link_command+="$wine_xdk\\bin\\win32\\link.exe /nologo /dll /release /xex:no "
@@ -178,6 +184,7 @@ link_command+="$wine_build\\remote_volume.obj "
 link_command+="$wine_build\\diagnostics.obj "
 link_command+="$wine_build\\xbox_usb_transport.obj "
 link_command+="$wine_build\\uac_descriptors.obj $wine_build\\uac_clock.obj "
+link_command+="$wine_build\\bluetooth.obj $wine_build\\bt_hci.obj "
 link_command+="$wine_build\\detour.obj xapilib.lib xboxkrnl.lib libcMT.lib"
 "${wine_env[@]}" wine cmd /c "$link_command"
 
