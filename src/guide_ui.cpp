@@ -275,7 +275,9 @@ void RefreshRowVisibility(VolumeScene* state) {
   if (!state || !state->layout_ready) return;
   AudioDeviceInfo info;
   if (!AudioGetDeviceInfo(&info)) return;
-  const bool bluetooth = !info.connected && BluetoothAdapterPresent();
+  // With Bluetooth built in, the row is always there when no DAC is in use,
+  // so the page can say what to connect.
+  const bool bluetooth = !info.connected && USB_AUDIO360_BLUETOOTH;
   if (bluetooth != state->bluetooth) SetRowMode(state, bluetooth);
   const bool visible = info.connected != FALSE || bluetooth;
   if (visible == state->visible) return;
@@ -1046,11 +1048,6 @@ HRESULT APIENTRY BluetoothObjectProc(HXUIOBJ object, XUIMessage* message,
       g_xui.set_user_focus(state->shown ? state->devices[0] : state->scan_button, state->user);
       state->focus_pending = false;
     }
-    if (!BluetoothAdapterPresent() && g_xui.tree_has_focus(object) &&
-        !g_xui.in_transition(object)) {
-      SettingsBack(object, state->user);
-      return S_OK;
-    }
     RefreshBluetooth(state, false);
   } else if (message->dwMessage == XM_TRANSITION_END && message->pvData &&
       message->cbData >= sizeof(XUIMessageTransition)) {
@@ -1187,8 +1184,7 @@ fail:
 // Same navigation contract as OpenSettings: expanded pages navigate from
 // the validated outer Guide HUDScene with OpenType Full (2).
 bool OpenBluetooth(VolumeScene* state, BYTE user) {
-  if (!state || !state->host_scene || !BluetoothAdapterPresent() ||
-      !RegisterBluetoothClass()) return false;
+  if (!state || !state->host_scene || !RegisterBluetoothClass()) return false;
   HXUIOBJ guide_scene = g_guide_main_scene;
   LPCWSTR guide_id = 0;
   if (!guide_scene || !g_xui.valid(guide_scene) ||

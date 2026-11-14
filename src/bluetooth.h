@@ -2,6 +2,10 @@
 #pragma once
 #include <xtl.h>
 
+#ifndef USB_AUDIO360_BLUETOOTH
+#define USB_AUDIO360_BLUETOOTH 1
+#endif
+
 // Stage 1: a claimed USB Bluetooth HCI adapter is reset and runs one inquiry;
 // results go to usb_audio360.log and UsbBtDiagnostic.
 
