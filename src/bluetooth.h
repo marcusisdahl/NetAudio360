@@ -12,6 +12,9 @@
 // USB domain (add/remove hooks). Only publish state; never block or log.
 VOID BluetoothDeviceAttached(void* handle);
 VOID BluetoothDeviceRemoved();
+// Called after the kernel's add completion returned for the claimed adapter;
+// records the device node and its default-endpoint slot in UsbBtProbe.
+VOID BluetoothRecordAddComplete(void* handle);
 
 // Snapshot for the Guide (any passive thread).
 enum BluetoothUiStatus {

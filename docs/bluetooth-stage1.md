@@ -146,6 +146,22 @@ reads a snapshot (`BluetoothGetUiState`) and never touches USB.
   3000) now delays the first request, and `bt-open-default status=` logs the
   result.
 
+- Read-only kernel inspection: export 746 only copies
+  `table[0x801A80A0][node[0xA] & 0x7F]` and always returns 0. The
+  add-complete routine (740) clears that slot and closes the enumerator's
+  default endpoint once a node is finished, unless the node keeps it (bit
+  0x80 at node+8 clear and, for a device-level node, node+4 non-zero). A
+  device-class E0 adapter is a device-level node, unlike a DAC's interface
+  nodes, so 746 can hand back endpoint 0 and the next control transfer runs
+  into a NULL endpoint at DPC level on processor 2. Because the log is on
+  Usb0, a wedged USB DPC can also swallow the last log lines.
+- Probe build: `UsbBtProbe[16]` (marker `0x55414250`) holds the node bytes
+  and default slot after add-complete ([1..5]) and before the open ([6..10]),
+  the endpoint 746 returned ([11]) and the add count ([12]). The worker logs
+  both snapshots and stops with error `0xb00b` instead of sending a request
+  when the endpoint is 0. The transport also refuses any TRB with a NULL
+  endpoint.
+
 ## Next
 
 Stage 2 adds Secure Simple Pairing, link keys in the ini, and connect/forget.

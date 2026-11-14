@@ -16,6 +16,9 @@
 
 // Live counters for XBDM/debug inspection; see the index list below.
 extern "C" volatile DWORD UsbBtDiagnostic[16] = {0};
+// Kernel device-node probe (see docs/bluetooth-stage1.md). Readable over XBDM
+// even when a log write to Usb0 is lost.
+extern "C" volatile DWORD UsbBtProbe[16] = {0};
 
 #ifndef USB_AUDIO360_BT_CLAIM_ONLY
 #define USB_AUDIO360_BT_CLAIM_ONLY 0
@@ -28,6 +31,26 @@ extern "C" volatile DWORD UsbBtDiagnostic[16] = {0};
 #endif
 
 namespace {
+
+// Kernel 17559 (checked at load): one 16-byte node per device/interface;
+// node+0xA indexes the default-endpoint table, which the add-complete path
+// clears when it closes the enumerator's default endpoint.
+DWORD* const kDefaultEndpointTable = (DWORD*)0x801A80A0;
+enum ProbeIndex {
+  kProbeMarker = 0,
+  kProbeAfterAdd = 1,      // 1-4 node bytes 0-15, 5 default slot
+  kProbeBeforeOpen = 6,    // 6-9 node bytes 0-15, 10 default slot
+  kProbeOpenEndpoint = 11,
+  kProbeAddCount = 12
+};
+
+void SnapshotNode(void* handle, int base, DWORD* slot_out) {
+  const DWORD* node = (const DWORD*)handle;
+  for (int i = 0; i < 4; ++i) UsbBtProbe[base + i] = node[i];
+  DWORD slot = kDefaultEndpointTable[((const BYTE*)handle)[0xA] & 0x7F];
+  UsbBtProbe[base + 4] = slot;
+  if (slot_out) *slot_out = slot;
+}
 
 enum DiagnosticIndex {
   kDiagMarker = 0,          // 0x55414254 'UABT'
@@ -76,7 +99,8 @@ enum Error {
   kErrEventSubmit = 0xb007,
   kErrEventStatus = 0xb008,
   kErrScan = 0xb009,
-  kErrRearm = 0xb00a
+  kErrRearm = 0xb00a,
+  kErrNoDefaultEndpoint = 0xb00b
 };
 
 // Kernel transfer request layout shared with audio.cpp. The kernel's async
@@ -399,11 +423,29 @@ void StartAttachment() {
   SetPhase(kPhaseFailed);
   return;
 #endif
+  Log("bt-node after-add %08x %08x %08x %08x default-slot=0x%08x adds=%u",
+      (unsigned)UsbBtProbe[kProbeAfterAdd], (unsigned)UsbBtProbe[kProbeAfterAdd + 1],
+      (unsigned)UsbBtProbe[kProbeAfterAdd + 2], (unsigned)UsbBtProbe[kProbeAfterAdd + 3],
+      (unsigned)UsbBtProbe[kProbeAfterAdd + 4], (unsigned)UsbBtProbe[kProbeAddCount]);
+  DWORD slot = 0;
+  SnapshotNode(g_handle, kProbeBeforeOpen, &slot);
+  Log("bt-node before-open %08x %08x %08x %08x default-slot=0x%08x",
+      (unsigned)UsbBtProbe[kProbeBeforeOpen], (unsigned)UsbBtProbe[kProbeBeforeOpen + 1],
+      (unsigned)UsbBtProbe[kProbeBeforeOpen + 2], (unsigned)UsbBtProbe[kProbeBeforeOpen + 3],
+      (unsigned)slot);
   Step("open-default");
   LONG status = UsbTransportOpenDefault(g_handle, &g_control.trb.endpoint);
+  UsbBtProbe[kProbeOpenEndpoint] = g_control.trb.endpoint;
   Log("bt-open-default status=0x%08x endpoint=0x%08x", (unsigned)status,
       (unsigned)g_control.trb.endpoint);
   if (status < 0) { Fail(kErrOpenDefault, status); return; }
+  if (!g_control.trb.endpoint) {
+    // The kernel closed this device's default endpoint when the add hook
+    // completed. A control transfer on a NULL endpoint wedges the USB DPC.
+    Log("bt-adapter has no default endpoint; stopping without USB requests");
+    Fail(kErrNoDefaultEndpoint, 0);
+    return;
+  }
   SetPhase(kPhaseConfigHeader);
   Step("get-configuration");
   QueueControl(0x80, 6, 0x0200, 0, 9);  // GET_DESCRIPTOR(configuration)
@@ -629,6 +671,12 @@ void Tick() {
 }
 
 }  // namespace
+
+VOID BluetoothRecordAddComplete(void* handle) {
+  UsbBtProbe[kProbeMarker] = 0x55414250;  // 'UABP'
+  ++UsbBtProbe[kProbeAddCount];
+  if (handle) SnapshotNode(handle, kProbeAfterAdd, 0);
+}
 
 VOID BluetoothDeviceAttached(void* handle) {
   g_attached_at = GetTickCount();

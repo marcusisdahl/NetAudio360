@@ -670,7 +670,9 @@ static int AddDeviceCompleteHook(DeviceHandle* handle, int status) {
     InterlockedExchange((volatile LONG*)&g_bluetooth_handle, (LONG)handle);
     BluetoothDeviceAttached(handle);
     // Same completion contract as the audio claim below.
-    return g_add_detour.Original<AddDeviceCompleteFn>()(handle, 0);
+    int result = g_add_detour.Original<AddDeviceCompleteFn>()(handle, 0);
+    BluetoothRecordAddComplete(handle);
+    return result;
   }
   UsbAudioDiagnostic[0] = profile.audio_class_version;
   memset(&g_extension, 0, sizeof(g_extension));

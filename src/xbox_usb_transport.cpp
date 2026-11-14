@@ -116,6 +116,9 @@ LONG Dispatch(Operation op, void* handle, void* transfer, WORD* lengths,
               int type, int address, int max_packet, int interval) {
   // Never call the blocking dispatcher from DPC/interrupt context.
   if (!g_dispatch || !handle || !transfer || CurrentIrql() != 0) return -3;
+  // A TRB without an endpoint would reach the host controller as NULL.
+  if ((op == kControl || op == kAsync || op == kIsoch) && !*(DWORD*)transfer)
+    return -5;
   Request request;
   request.operation = op; request.handle = handle; request.transfer = transfer;
   request.lengths = lengths; request.type = type; request.address = address;
