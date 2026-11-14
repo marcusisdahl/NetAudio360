@@ -209,9 +209,8 @@ struct VolumeScene {
   // Look of the native row above (btnMCX), so the Bluetooth row matches it.
   WCHAR row_visual[64];
   float row_point_size;
-  // The gap between the native rows: gap_offset is where a 28-unit row
-  // touching the row below starts, relative to the panel.
-  float gap_offset, gap_height;
+  // Placement of the Bluetooth row in the gap, relative to the panel.
+  float gap_offset, gap_height, row_height;
   DWORD tune_applied;
 };
 
@@ -287,11 +286,12 @@ extern "C" volatile DWORD UsbGuideTune[4] = {0x55414754, 0, 0, 0};
 void SetRowMode(VolumeScene* state, bool bluetooth) {
   if (state->expanded) SetExpanded(state, false, XUSER_INDEX_FOCUS, false);
   // Copy the native row's visual so the text is drawn in the same colour.
-  // That visual is a fixed 28-unit row with its divider at the bottom, so
-  // sit the row on the bottom of the gap: its divider then lands on Select
-  // Music's own top line and only one line shows.
+  // XuiButtonGuide does not stretch: measured on COD, its dividers sit at
+  // y + h - 28 and y + 28 (they move inward as the height grows). The
+  // geometry in InjectMedia puts them exactly on the native lines.
   const bool fill = bluetooth && state->gap_height >= 28.0f;
-  float row_y = fill ? state->gap_offset : 0.0f, row_height = 28.0f;
+  float row_y = fill ? state->gap_offset : 0.0f;
+  float row_height = fill ? state->row_height : 28.0f;
   if (bluetooth && UsbGuideTune[2]) {
     row_y = (float)(LONG)UsbGuideTune[1] / 100.0f;
     row_height = (float)(LONG)UsbGuideTune[2] / 100.0f;
@@ -1697,7 +1697,11 @@ bool InjectMedia(HXUIOBJ scene) {
     const float gap_top = above_rect.y + above_rect.height;
     const float gap = next_rect.y - gap_top;
     if (gap >= 28 && gap <= 40) {
-      state->gap_offset = next_rect.y - 28 - insertion_y;
+      // Tuned live on COD (gap 31: y +3.0, height 24 relative to a panel
+      // 1.5 below the gap top): the top divider lands on the line under the
+      // row above and the bottom one on Select Music's line.
+      state->gap_offset = gap_top + 4.5f - insertion_y;
+      state->row_height = 55.0f - gap;
       state->gap_height = gap;
     }
     char line[160];
