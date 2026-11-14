@@ -17,6 +17,10 @@
 // Live counters for XBDM/debug inspection; see the index list below.
 extern "C" volatile DWORD UsbBtDiagnostic[16] = {0};
 
+#ifndef USB_AUDIO360_BT_CLAIM_ONLY
+#define USB_AUDIO360_BT_CLAIM_ONLY 0
+#endif
+
 namespace {
 
 enum DiagnosticIndex {
@@ -381,6 +385,12 @@ void StartAttachment() {
   InterlockedExchange(&g_event_fault, 0);
   for (int i = 1; i < 16; ++i) UsbBtDiagnostic[i] = 0;
   Log("bt-adapter attached");
+#if USB_AUDIO360_BT_CLAIM_ONLY
+  // Bring-up control: keep the claim but issue no USB requests at all.
+  Log("bt-claim-only build: no USB requests will be sent");
+  SetPhase(kPhaseFailed);
+  return;
+#endif
   Step("open-default");
   LONG status = UsbTransportOpenDefault(g_handle, &g_control.trb.endpoint);
   if (status < 0) { Fail(kErrOpenDefault, status); return; }
