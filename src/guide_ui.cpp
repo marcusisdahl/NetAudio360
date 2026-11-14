@@ -214,6 +214,8 @@ struct VolumeScene {
   DWORD tune_applied;
   bool label_logged, label_base_known;
   float label_base_x, label_base_y;
+  float cell_top;  // Top of the gap relative to the panel.
+  float green_y, green_height;  // Focus fill, relative to the button.
 };
 
 struct SettingsScene {
@@ -287,8 +289,11 @@ bool DacConnected() {
 // Debug aid only.
 extern "C" volatile DWORD UsbGuideTune[7] = {0x55414754, 0, 0, 0, 0, 0, 0};
 
-// Moves the text elements of the button's visual by dy from where the skin
-// put them; logs the visual's children once so we know what is there.
+// Moves the text elements of the button's visual by dx/dy from where the
+// skin put them, and stretches GreenHighlight (the focus fill, 25 units in
+// the skin) over the whole cell when green_height is set. Logs the visual's
+// children once. Re-applied from the refresh timer, since focus changes
+// replay the visual's timeline.
 void NudgeRowLabel(VolumeScene* state, float dx, float dy) {
   HXUIOBJ visual = 0;
   if (g_xui.visual(state->volume_button, &visual) < 0 || !visual) return;
@@ -308,7 +313,13 @@ void NudgeRowLabel(VolumeScene* state, float dx, float dy) {
                     id ? id : L"?", (int)(position.y * 100), (int)(h * 100));
         DiagnosticsText(line);
       }
-      if (id && _wcsnicmp(id, L"text", 4) == 0) {
+      if (id && state->green_height > 0 && wcscmp(id, L"GreenHighlight") == 0) {
+        if (position.y != state->green_y || h != state->green_height) {
+          position.y = state->green_y;
+          g_xui.set_position(child, &position);
+          SetFloat(child, L"Height", state->green_height);
+        }
+      } else if (id && _wcsnicmp(id, L"text", 4) == 0) {
         if (!state->label_base_known) {
           state->label_base_x = position.x;
           state->label_base_y = position.y;
@@ -362,6 +373,9 @@ void SetRowMode(VolumeScene* state, bool bluetooth) {
     if (bluetooth && UsbGuideTune[4]) scale.y = (float)UsbGuideTune[4] / 1000.0f;
     g_xui.set_scale(state->volume_button, &scale);
     state->label_base_known = false;  // The skin rebuilds the visual.
+    // Fill the cell between the native lines when focused (not with scale).
+    state->green_height = fill && !UsbGuideTune[4] ? state->gap_height : 0;
+    state->green_y = state->cell_top - row_y;
     if (bluetooth)
       SetFloat(state->volume_button, L"PointSize",
                state->row_point_size > 0 ? state->row_point_size : 12);
@@ -386,11 +400,16 @@ void RefreshRowVisibility(VolumeScene* state) {
     SetRowMode(state, bluetooth);
     state->row_text[0] = 0;  // Re-apply the label below.
   }
-  if (state->bluetooth && (UsbGuideTune[5] || UsbGuideTune[6]))
-    NudgeRowLabel(state, (float)(LONG)UsbGuideTune[6] / 100.0f,
-                  (float)(LONG)UsbGuideTune[5] / 100.0f);
-  else if (state->bluetooth && !state->label_logged)
-    NudgeRowLabel(state, 0, 0);
+  if (state->bluetooth) {
+    // Defaults tuned live on COD: the label sits 2.5 low and 1 right in the
+    // shortened visual.
+    const bool tuned = state->gap_height > 0;
+    const float dx = UsbGuideTune[6] ? (float)(LONG)UsbGuideTune[6] / 100.0f
+                                     : (tuned ? -1.0f : 0.0f);
+    const float dy = UsbGuideTune[5] ? (float)(LONG)UsbGuideTune[5] / 100.0f
+                                     : (tuned ? -2.5f : 0.0f);
+    NudgeRowLabel(state, dx, dy);
+  }
   if (state->bluetooth) {
     // "Bluetooth - <device>" while a device is connected.
     WCHAR text[96] = L"Bluetooth";
@@ -1757,6 +1776,7 @@ bool InjectMedia(HXUIOBJ scene) {
       // 1.5 below the gap top): the top divider lands on the line under the
       // row above and the bottom one on Select Music's line.
       state->gap_offset = gap_top + 4.5f - insertion_y;
+      state->cell_top = gap_top - insertion_y;
       state->row_height = 55.0f - gap;
       state->gap_height = gap;
     }
