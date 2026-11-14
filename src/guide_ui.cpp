@@ -212,6 +212,8 @@ struct VolumeScene {
   // Placement of the Bluetooth row in the gap, relative to the panel.
   float gap_offset, gap_height, row_height;
   DWORD tune_applied;
+  bool label_logged, label_base_known;
+  float label_base_x, label_base_y;
 };
 
 struct SettingsScene {
@@ -280,8 +282,53 @@ bool DacConnected() {
 // devices live; the USB Audio buttons and label are hidden.
 // Live tuning for the Bluetooth row's placement, poked over XBDM while the
 // Guide is open: [0] 'UAGT', [1] y offset and [2] height in 1/100 units
-// (0 = built-in default), [3] bumped to apply. Debug aid only.
-extern "C" volatile DWORD UsbGuideTune[4] = {0x55414754, 0, 0, 0};
+// (0 = built-in default), [3] bumped to apply, [4] vertical scale in 1/1000
+// (0 = none), [5]/[6] label y/x offset in 1/100 units (signed, 0 = none).
+// Debug aid only.
+extern "C" volatile DWORD UsbGuideTune[7] = {0x55414754, 0, 0, 0, 0, 0, 0};
+
+// Moves the text elements of the button's visual by dy from where the skin
+// put them; logs the visual's children once so we know what is there.
+void NudgeRowLabel(VolumeScene* state, float dx, float dy) {
+  HXUIOBJ visual = 0;
+  if (g_xui.visual(state->volume_button, &visual) < 0 || !visual) return;
+  HXUIOBJ child = 0;
+  if (g_xui.first(visual, &child) < 0) return;
+  for (unsigned i = 0; child && i < 16; ++i) {
+    LPCWSTR id = 0;
+    D3DXVECTOR3 position;
+    if (g_xui.id(child, &id) >= 0 && g_xui.position(child, &position) >= 0) {
+      PropertyValue height;
+      const float h = GetProperty(child, L"Height", &height) &&
+          height.get()->type == XUI_EPT_FLOAT ? height.get()->fVal : -1;
+      if (!state->label_logged) {
+        char line[160];
+        _snprintf_s(line, sizeof(line), _TRUNCATE,
+                    "guide row visual child %u id=%ls y=%d h=%d (x100)", i,
+                    id ? id : L"?", (int)(position.y * 100), (int)(h * 100));
+        DiagnosticsText(line);
+      }
+      if (id && _wcsnicmp(id, L"text", 4) == 0) {
+        if (!state->label_base_known) {
+          state->label_base_x = position.x;
+          state->label_base_y = position.y;
+          state->label_base_known = true;
+        }
+        const float want_x = state->label_base_x + dx;
+        const float want = state->label_base_y + dy;
+        if (position.y != want || position.x != want_x) {
+          position.x = want_x;
+          position.y = want;
+          g_xui.set_position(child, &position);
+        }
+      }
+    }
+    HXUIOBJ next = 0;
+    if (g_xui.next(child, &next) < 0) break;
+    child = next;
+  }
+  state->label_logged = true;
+}
 
 void SetRowMode(VolumeScene* state, bool bluetooth) {
   if (state->expanded) SetExpanded(state, false, XUSER_INDEX_FOCUS, false);
@@ -311,6 +358,10 @@ void SetRowMode(VolumeScene* state, bool bluetooth) {
       SetString(state->volume_button, L"NavRight",
                 bluetooth ? L"" : L"MicrophoneMuteButton");
   if (ok) {
+    D3DXVECTOR3 scale(1, 1, 1);
+    if (bluetooth && UsbGuideTune[4]) scale.y = (float)UsbGuideTune[4] / 1000.0f;
+    g_xui.set_scale(state->volume_button, &scale);
+    state->label_base_known = false;  // The skin rebuilds the visual.
     if (bluetooth)
       SetFloat(state->volume_button, L"PointSize",
                state->row_point_size > 0 ? state->row_point_size : 12);
@@ -335,6 +386,11 @@ void RefreshRowVisibility(VolumeScene* state) {
     SetRowMode(state, bluetooth);
     state->row_text[0] = 0;  // Re-apply the label below.
   }
+  if (state->bluetooth && (UsbGuideTune[5] || UsbGuideTune[6]))
+    NudgeRowLabel(state, (float)(LONG)UsbGuideTune[6] / 100.0f,
+                  (float)(LONG)UsbGuideTune[5] / 100.0f);
+  else if (state->bluetooth && !state->label_logged)
+    NudgeRowLabel(state, 0, 0);
   if (state->bluetooth) {
     // "Bluetooth - <device>" while a device is connected.
     WCHAR text[96] = L"Bluetooth";
