@@ -87,11 +87,11 @@ int main() {
   n = SdpHandle(search, sizeof(search), out, sizeof(out));
   assert(n == 14 && out[0] == 0x03 && out[6] == 1 && out[8] == 1);
   assert(out[9] == 0 && out[10] == 1 && out[11] == 0 && out[12] == 1 && out[13] == 0);
-  // L2CAP is in both records.
+  // L2CAP is in all three records.
   const u8 search_l2cap[] = {0x02, 0x00, 0x01, 0x00, 0x08, 0x35, 0x03, 0x19, 0x01,
                              0x00, 0x00, 0x05, 0x00};
   n = SdpHandle(search_l2cap, sizeof(search_l2cap), out, sizeof(out));
-  assert(n == 18 && out[6] == 2 && out[16] == 2);
+  assert(n == 22 && out[6] == 3 && out[20] == 3);
   // AVRCP: the remote control service class finds the target record.
   const u8 avrcp[] = {0x19, 0x11, 0x0E};
   n = SearchAttribute(avrcp, sizeof(avrcp), 0xFFFF, zero, 1, out, sizeof(out));

@@ -131,4 +131,31 @@ unsigned AvrcpHandle(const u8* in, unsigned n, u8* out, unsigned capacity,
   return n;
 }
 
+unsigned AvrcpRegisterVolume(u8 label, u8* out, unsigned capacity) {
+  static const u8 kCommand[] = {
+    0x00, 0x11, 0x0E,        // AVCTP: command, A/V remote control PID
+    0x03, kPanel, 0x00,      // NOTIFY, panel, vendor dependent
+    0x00, 0x19, 0x58,        // Bluetooth SIG
+    kRegisterNotification, 0x00, 0x00, 0x05,
+    0x0D, 0x00, 0x00, 0x00, 0x00  // EVENT_VOLUME_CHANGED, interval 0
+  };
+  if (capacity < sizeof(kCommand)) return 0;
+  memcpy(out, kCommand, sizeof(kCommand));
+  out[0] = (u8)((label & 0x0F) << 4);
+  return sizeof(kCommand);
+}
+
+int AvrcpVolumeResponse(const u8* in, unsigned n, u8* volume) {
+  if (n < 13 || !(in[0] & 0x02) || (in[0] & 0x0C) || in[1] != 0x11 ||
+      in[2] != 0x0E || in[5] != kVendorDependent || memcmp(in + 6, kBtSig, 3) ||
+      in[9] != kRegisterNotification)
+    return 0;
+  if (in[3] == kRejected || in[3] == kNotImplemented) return 3;
+  if (n < 15 || in[13] != 0x0D) return 0;
+  *volume = (u8)(in[14] & 0x7F);
+  if (in[3] == kInterim) return 1;
+  if (in[3] == 0x0D) return 2;  // CHANGED
+  return 0;
+}
+
 }  // namespace bt

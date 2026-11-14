@@ -63,5 +63,11 @@ if they have not. `bt::AvrcpHandle` (src/bt_avrcp.cpp) answers UNIT/SUBUNIT
 INFO, PASS THROUGH (accepted), GetCapabilities, GetPlayStatus and
 RegisterNotification (playback status / track changed, interim only), and
 rejects the rest. PASS THROUGH volume up/down/mute presses change the plugin
-volume (`bt-avrcp key=...` in the log). Absolute volume is not implemented,
-so headphones that only support absolute volume will not send keys yet.
+volume (`bt-avrcp key=...` in the log).
+
+Absolute volume: an AVRCP Controller record (handle 0x00010003, category 2)
+is offered too, and once AVCTP is configured the console registers for the
+headphones' EVENT_VOLUME_CHANGED (re-registering after every CHANGED). The
+headphones then render their own volume (touch swipes on the NC 700) and
+report it (`bt-avrcp absolute volume=N/127`); the console volume is left as
+is.

@@ -88,6 +88,21 @@ const Attribute kAvrcpRecord[] = {
 };
 const u32 kAvrcpUuids[] = {0x110C, 0x0100, 0x0017, 0x1002, 0x110E};
 
+// AVRCP Controller record, category 2 (monitor/amplifier): tells the
+// headphones we control their absolute volume.
+const u8 kControllerHandle[] = {0x0A, 0x00, 0x01, 0x00, 0x03};
+const u8 kControllerClasses[] = {0x35, 0x06, 0x19, 0x11, 0x0E, 0x19, 0x11, 0x0F};
+const u8 kControllerFeatures[] = {0x09, 0x00, 0x02};
+const Attribute kControllerRecord[] = {
+  {0x0000, kControllerHandle, sizeof(kControllerHandle)},
+  {0x0001, kControllerClasses, sizeof(kControllerClasses)},
+  {0x0004, kAvrcpProtocols, sizeof(kAvrcpProtocols)},
+  {0x0005, kBrowse, sizeof(kBrowse)},
+  {0x0009, kAvrcpProfiles, sizeof(kAvrcpProfiles)},
+  {0x0311, kControllerFeatures, sizeof(kControllerFeatures)},
+};
+const u32 kControllerUuids[] = {0x110E, 0x110F, 0x0100, 0x0017, 0x1002};
+
 struct Record {
   u32 handle;
   const Attribute* attributes;
@@ -101,6 +116,8 @@ const Record kRecords[] = {
    BT_COUNT(kA2dpUuids)},
   {kSdpAvrcpTargetHandle, kAvrcpRecord, BT_COUNT(kAvrcpRecord), kAvrcpUuids,
    BT_COUNT(kAvrcpUuids)},
+  {kSdpAvrcpControllerHandle, kControllerRecord, BT_COUNT(kControllerRecord),
+   kControllerUuids, BT_COUNT(kControllerUuids)},
 };
 const unsigned kRecordTotal = BT_COUNT(kRecords);
 const unsigned kMaxAttributes = 8;

@@ -16,13 +16,15 @@ u16 Le16(const u8* p) { return (u16)(p[0] | (p[1] << 8)); }
 
 struct Recorder : A2dpObserver {
   Recorder() : states(0), last_state(0), failed(0), failure(0), detail(0),
-               configured(0), keys(0), last_key(0) {
+               configured(0), keys(0), last_key(0),
+               volumes(0), last_volume(0), volume_changed(false) {
     memset(&config, 0, sizeof(config));
   }
   void OnA2dpState(unsigned s) { ++states; last_state = s; }
   void OnA2dpFailed(unsigned f, unsigned d) { ++failed; failure = f; detail = d; }
   void OnA2dpConfigured(const SbcConfig& c) { ++configured; config = c; }
   void OnAvrcpKey(unsigned op) { ++keys; last_key = op; }
+  void OnAvrcpVolume(unsigned v, bool c) { ++volumes; last_volume = v; volume_changed = c; }
   int states;
   unsigned last_state;
   int failed;
@@ -30,6 +32,8 @@ struct Recorder : A2dpObserver {
   int configured;
   SbcConfig config;
   unsigned keys, last_key;
+  unsigned volumes, last_volume;
+  bool volume_changed;
 };
 
 // Pops one output frame; checks the CID and returns the payload.
@@ -215,6 +219,21 @@ void TestStreamSetup() {
   assert(Le16(d) == 0x43 && Le16(d + 2) == 0x60 && Le16(d + 4) == 0);
   d = ExpectSignal(a, 0x04, &id, &n);
   assert(Le16(d) == 0x60);
+  // Both configurations done: we register for absolute volume.
+  u8 avctp_cfg[4] = {0x43, 0x00, 0x00, 0x00};
+  Signal(a, 0x04, 9, avctp_cfg, 4, now);
+  d = ExpectSignal(a, 0x05, &id, &n);
+  u8 avctp_cfr[6] = {0x43, 0x00, 0x00, 0x00, 0x00, 0x00};
+  Signal(a, 0x05, 2, avctp_cfr, 6, now);
+  m = Pop(a, 0x0060, &n);
+  assert(n == 18 && m[3] == 0x03 && m[9] == 0x31 && m[13] == 0x0D);
+  u8 avrcp_label = (u8)(m[0] >> 4);
+  u8 changed[15] = {(u8)((avrcp_label << 4) | 2), 0x11, 0x0E, 0x0D, 0x48, 0x00, 0x00,
+                    0x19, 0x58, 0x31, 0x00, 0x00, 0x02, 0x0D, 0x40};
+  Frame(a, 0x0043, changed, 15, now);
+  assert(r.volumes == 1 && r.last_volume == 0x40 && r.volume_changed);
+  m = Pop(a, 0x0060, &n);  // Re-registered.
+  assert(n == 18 && m[13] == 0x0D && (m[0] >> 4) != avrcp_label);
   u8 key[8] = {0x30, 0x11, 0x0E, 0x00, 0x48, 0x7C, 0x42, 0x00};
   Frame(a, 0x0043, key, 8, now);
   m = Pop(a, 0x0060, &n);

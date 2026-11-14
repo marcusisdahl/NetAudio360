@@ -514,6 +514,10 @@ class A2dpLog : public bt::A2dpObserver {
     else if (operation == bt::kAvrcpMute) AudioSetOutputMuted(!AudioIsOutputMuted());
     Log("bt-avrcp key=0x%02x volume=%d", operation, (int)AudioGetVolume());
   }
+  void OnAvrcpVolume(unsigned volume, bool changed) {
+    // The headphones render absolute volume themselves; just report it.
+    Log("bt-avrcp absolute volume=%u/127 %s", volume, changed ? "changed" : "current");
+  }
   void OnA2dpConfigured(const bt::SbcConfig& c) {
     g_sbc_ready = g_sbc.Configure(c);
     Log("bt-a2dp sbc freq=%u blocks=%u mode=%u alloc=%u bitpool=%u "

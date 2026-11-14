@@ -131,6 +131,8 @@ void A2dpSource::Reset() {
   memset(&sdp_, 0, sizeof(sdp_));
   memset(&avctp_, 0, sizeof(avctp_));
   avctp_tried_ = false;
+  volume_registered_ = false;
+  avctp_label_ = 0;
   streaming_since_ = 0;
   remote_signal_mtu_ = 672;
   remote_media_mtu_ = 672;
@@ -248,7 +250,18 @@ bool A2dpSource::Start(unsigned now) {
   return true;
 }
 
+void A2dpSource::RegisterVolume() {
+  u8* out = Begin(avctp_.remote_cid, 32);
+  if (!out) return;
+  avctp_label_ = (u8)((avctp_label_ + 1) & 0x0F);
+  unsigned length = AvrcpRegisterVolume(avctp_label_, out, 32);
+  Put16(out - 4, length);
+  Commit(length);
+  volume_registered_ = true;
+}
+
 void A2dpSource::ChannelReady(unsigned now) {
+  if (avrcp_connected() && !volume_registered_) RegisterVolume();
   if (state_ == kA2dpSignalConnect && signal_.our_config_done &&
       signal_.their_config_done) {
     // Signalling channel up: find the headphones' audio sink endpoints.
@@ -469,6 +482,16 @@ void A2dpSource::OnAvctp(const u8* p, unsigned n) {
   unsigned capacity = 64;
   u8* out = Begin(avctp_.remote_cid, capacity);
   if (!out) return;  // Queue full: drop the reply; the headset retries.
+  u8 volume = 0;
+  int response = AvrcpVolumeResponse(p, n, &volume);
+  if (response) {
+    if (response != 3 && observer_) observer_->OnAvrcpVolume(volume, response == 2);
+    if (response == 2) {
+      RegisterVolume();  // Our slot is still free: Begin above is unused.
+      return;
+    }
+    return;
+  }
   u8 pressed = 0;
   unsigned length = AvrcpHandle(p, n, out, capacity, &pressed);
   if (length) {

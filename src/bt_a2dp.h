@@ -73,6 +73,10 @@ class A2dpObserver {
   virtual void OnA2dpConfigured(const SbcConfig& config) = 0;
   // A remote-control key from the headphones (AVRCP PASS THROUGH, pressed).
   virtual void OnAvrcpKey(unsigned operation) { (void)operation; }
+  // Headphones' absolute volume (0..127); changed = the user moved it.
+  virtual void OnAvrcpVolume(unsigned volume, bool changed) {
+    (void)volume; (void)changed;
+  }
 };
 
 class A2dpSource {
@@ -151,6 +155,9 @@ class A2dpSource {
   u8 pending_signal_;
   Channel signal_, media_, sdp_, avctp_;
   bool avctp_tried_;
+  bool volume_registered_;
+  u8 avctp_label_;
+  void RegisterVolume();
   unsigned streaming_since_;
   u16 remote_signal_mtu_, remote_media_mtu_, remote_sdp_mtu_;
   unsigned sdp_requests_;

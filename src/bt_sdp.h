@@ -12,6 +12,7 @@ namespace bt {
 
 const u32 kSdpA2dpSourceHandle = 0x00010001;
 const u32 kSdpAvrcpTargetHandle = 0x00010002;
+const u32 kSdpAvrcpControllerHandle = 0x00010003;
 
 // Builds the response PDU for one request PDU. out_capacity is the most the
 // channel can carry (the remote's L2CAP MTU). Returns the response length,

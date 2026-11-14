@@ -26,6 +26,13 @@ enum AvrcpOperation {
 unsigned AvrcpHandle(const u8* frame, unsigned length, u8* out,
                      unsigned capacity, u8* pressed);
 
+// Absolute volume (AVRCP 1.4+), console as controller: the command that
+// registers for the headphones' EVENT_VOLUME_CHANGED. Returns its length.
+unsigned AvrcpRegisterVolume(u8 label, u8* out, unsigned capacity);
+// Parses a response frame. Returns 1 for a volume INTERIM, 2 for CHANGED
+// (re-register then), 3 for a rejection, 0 otherwise; *volume is 0..127.
+int AvrcpVolumeResponse(const u8* frame, unsigned length, u8* volume);
+
 }  // namespace bt
 
 #endif  // USB_AUDIO360_BT_AVRCP_H_
