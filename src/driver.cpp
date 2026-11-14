@@ -20,6 +20,11 @@
 #ifndef USB_AUDIO360_BLUETOOTH
 #define USB_AUDIO360_BLUETOOTH 1
 #endif
+// Bring-up diagnostics: log every add-device completion, including ones the
+// kernel accepted itself (status 0) and interfaces of any class.
+#ifndef USB_AUDIO360_LOG_ALL_DEVICES
+#define USB_AUDIO360_LOG_ALL_DEVICES 1
+#endif
 
 extern "C" LONG XexGetProcedureAddress(HANDLE module, DWORD ordinal,
                                         PVOID address);
@@ -572,7 +577,8 @@ static void RecordDevice(DeviceHandle* handle, int status,
           ? g_get_interface_descriptor(handle) : 0;
   // Only AudioStreaming and Bluetooth (wireless controller) interfaces are
   // relevant. Avoid filling the bounded queue with unrelated interfaces.
-  if (!interface_descriptor ||
+  if (!interface_descriptor && !USB_AUDIO360_LOG_ALL_DEVICES) return;
+  if (!USB_AUDIO360_LOG_ALL_DEVICES &&
       ((interface_descriptor->interface_class != 1 ||
         interface_descriptor->interface_subclass != 2) &&
        interface_descriptor->interface_class != 0xE0)) return;
@@ -590,12 +596,18 @@ static void RecordDevice(DeviceHandle* handle, int status,
     observation.device_protocol = device_descriptor->device_protocol;
     observation.configuration_count = device_descriptor->configuration_count;
   }
-  observation.interface_number = interface_descriptor->interface_number;
-  observation.alternate_setting = interface_descriptor->alternate_setting;
-  observation.interface_class = interface_descriptor->interface_class;
-  observation.interface_subclass = interface_descriptor->interface_subclass;
-  observation.interface_protocol = interface_descriptor->interface_protocol;
-  observation.endpoint_count = interface_descriptor->endpoint_count;
+  if (interface_descriptor) {
+    observation.interface_number = interface_descriptor->interface_number;
+    observation.alternate_setting = interface_descriptor->alternate_setting;
+    observation.interface_class = interface_descriptor->interface_class;
+    observation.interface_subclass = interface_descriptor->interface_subclass;
+    observation.interface_protocol = interface_descriptor->interface_protocol;
+    observation.endpoint_count = interface_descriptor->endpoint_count;
+  } else {
+    observation.interface_class = 0xff;
+    observation.interface_subclass = 0xff;
+    observation.interface_protocol = 0xff;
+  }
   observation.controller = handle ? (*((BYTE*)handle + 8) & 3) : 0xff;
   observation.rejection = rejection;
   observation.add_status = status;
@@ -606,8 +618,11 @@ static void RecordDevice(DeviceHandle* handle, int status,
 static int AddDeviceCompleteHook(DeviceHandle* handle, int status) {
   // The first compatible playback interface owns the only plugin slot. A
   // secondary DAC/interface is left entirely to the kernel's normal path.
-  if (status == 0)
+  if (status == 0) {
+    if (USB_AUDIO360_LOG_ALL_DEVICES)
+      RecordDevice(handle, status, kDeviceKernelClaimed, 0);
     return g_add_detour.Original<AddDeviceCompleteFn>()(handle, status);
+  }
 
   AudioProfile profile;
   BYTE rejection = 0;

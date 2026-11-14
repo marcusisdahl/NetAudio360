@@ -11,6 +11,7 @@ enum UsbAudioDeviceDecision {
   kDeviceSlotBusy = 2,
   kDeviceTransportRejected = 3,
   kDeviceClaimed = 4,
+  kDeviceKernelClaimed = 5,
 };
 
 struct UsbAudioDeviceObservation {

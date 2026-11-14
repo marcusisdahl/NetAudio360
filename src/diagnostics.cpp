@@ -140,6 +140,7 @@ static const char* DecisionName(DWORD decision) {
     case kDeviceSlotBusy: return "slot-busy";
     case kDeviceTransportRejected: return "transport-rejected";
     case kDeviceClaimed: return "claimed";
+    case kDeviceKernelClaimed: return "kernel-accepted";
     default: return "unknown";
   }
 }
