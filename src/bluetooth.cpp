@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "bt_hci.h"
+#include "bt_link.h"
 #include "diagnostics.h"
 #include "xbox_usb_transport.h"
 
@@ -169,6 +170,23 @@ static BYTE g_drain[256];
 static WORD g_manufacturer = 0;
 static volatile LONG g_scan_request = 0;
 
+// One pending Guide request (pair/toggle/forget), guarded by g_ui_lock.
+enum RequestKind { kRequestNone = 0, kRequestPair, kRequestToggle, kRequestForget };
+struct Request { LONG kind; BYTE address[6]; };
+static Request g_request;
+
+// Paired devices, owned by this worker; persisted next to the ini.
+static bt::PairedStore g_paired;
+static bool g_paired_loaded = false;
+static char g_paired_path[MAX_PATH];
+static char g_paired_text[1024];
+// Name for the key of the device being paired (from the search results).
+static char g_pairing_name[bt::kMaxNameBytes];
+static DWORD g_link_result_count = 0;
+static DWORD g_link_failure = 0;
+static DWORD g_link_status = 0;
+static BYTE g_result_address[6];
+
 // Guide snapshot: written by the worker, copied out by the UI thread.
 static CRITICAL_SECTION g_ui_lock;
 static volatile LONG g_ui_ready = 0;
@@ -280,6 +298,100 @@ class LogObserver : public bt::ScanObserver {
 
 static LogObserver g_observer;
 static bt::Scanner g_scanner(&g_observer);
+
+// ---------------------------------------------------------------------------
+// Paired-device file (passive worker only).
+
+bool PairedPath() {
+  if (g_paired_path[0]) return true;
+  char ini[MAX_PATH];
+  if (!DiagnosticsSettingsPath(ini, sizeof(ini))) return false;
+  size_t length = strlen(ini);
+  if (length < 4 || length + 1 > sizeof(g_paired_path)) return false;
+  memcpy(g_paired_path, ini, length - 4);
+  strcpy(g_paired_path + length - 4, ".bt");  // usb_audio360.bt
+  return true;
+}
+
+void LoadPaired() {
+  if (g_paired_loaded || !PairedPath()) return;
+  g_paired_loaded = true;
+  HANDLE f = CreateFileA(g_paired_path, GENERIC_READ, FILE_SHARE_READ, 0,
+                         OPEN_EXISTING, 0, 0);
+  if (f == INVALID_HANDLE_VALUE) return;  // None yet.
+  DWORD high = 0, size = GetFileSize(f, &high), got = 0;
+  bool ok = !high && size < sizeof(g_paired_text) &&
+      ReadFile(f, g_paired_text, size, &got, 0) && got == size;
+  CloseHandle(f);
+  if (!ok || !g_paired.Parse(g_paired_text, size)) {
+    Log("bt-paired file unreadable; starting empty");
+    g_paired.Clear();
+    return;
+  }
+  Log("bt-paired loaded devices=%u", g_paired.count());
+}
+
+void SavePaired() {
+  if (!PairedPath()) return;
+  unsigned n = g_paired.Format(g_paired_text, sizeof(g_paired_text));
+  if (!n) return;
+  HANDLE f = CreateFileA(g_paired_path, GENERIC_WRITE, 0, 0, CREATE_ALWAYS,
+                         FILE_ATTRIBUTE_NORMAL, 0);
+  if (f == INVALID_HANDLE_VALUE) { Log("bt-paired save failed"); return; }
+  DWORD written = 0;
+  bool ok = WriteFile(f, g_paired_text, n, &written, 0) && written == n &&
+      FlushFileBuffers(f);
+  CloseHandle(f);
+  Log("bt-paired saved devices=%u ok=%u", g_paired.count(), ok ? 1u : 0u);
+}
+
+class LinkLog : public bt::LinkObserver {
+ public:
+  bool FindLinkKey(const bt::u8* address, bt::u8* key) {
+    const bt::PairedDevice* d = g_paired.Find(address);
+    if (!d) return false;
+    memcpy(key, d->key, 16);
+    return true;
+  }
+  void OnLinkKey(const bt::u8* address, const bt::u8* key, bt::u8 type) {
+    char text[18];
+    bt::FormatAddress(address, text);
+    Log("bt-paired addr=%s key_type=%u", text, type);  // Never log the key.
+    g_paired.Put(address, key, type, g_pairing_name);
+    SavePaired();
+  }
+  void OnLinkKeyRejected(const bt::u8* address) {
+    char text[18];
+    bt::FormatAddress(address, text);
+    Log("bt-link key rejected by addr=%s; forgetting it", text);
+    if (g_paired.Remove(address)) SavePaired();
+  }
+  void OnLinkState(unsigned state, const bt::u8* address) {
+    char text[18];
+    bt::FormatAddress(address, text);
+    Log("bt-link %s addr=%s", bt::LinkStateName(state), text);
+    if (state == bt::kLinkConnected) {
+      ++g_link_result_count;
+      g_link_failure = 0;
+      g_link_status = 0;
+      memcpy(g_result_address, address, 6);
+    }
+  }
+  void OnLinkFailed(unsigned failure, bt::u16 opcode, bt::u8 status,
+                    const bt::u8* address) {
+    char text[18];
+    bt::FormatAddress(address, text);
+    Log("bt-link failed reason=%s opcode=0x%04x status=0x%02x addr=%s",
+        bt::LinkFailureName(failure), opcode, status, text);
+    ++g_link_result_count;
+    g_link_failure = failure;
+    g_link_status = status;
+    memcpy(g_result_address, address, 6);
+  }
+};
+
+static LinkLog g_link_log;
+static bt::Link g_link(&g_link_log);
 
 // ---------------------------------------------------------------------------
 // USB-domain callbacks: copy, publish, return.
@@ -409,7 +521,12 @@ void DrainEvents(DWORD now) {
       used += g_assembler.Push(g_drain + used, n - used, &complete);
       if (!complete) continue;
       ++UsbBtDiagnostic[kDiagEventsParsed];
-      g_scanner.OnEvent(g_assembler.buffer(), g_assembler.length(), now);
+      // Setup and searches belong to the scanner; once it is done, the
+      // link layer owns the controller.
+      if (!g_scanner.finished())
+        g_scanner.OnEvent(g_assembler.buffer(), g_assembler.length(), now);
+      else
+        g_link.OnEvent(g_assembler.buffer(), g_assembler.length(), now);
     }
   }
 }
@@ -425,6 +542,8 @@ void StartAttachment() {
   g_manufacturer = 0;
   InterlockedExchange(&g_scan_request, 0);
   InterlockedExchange(&g_event_fault, 0);
+  g_link.Reset();
+  LoadPaired();
   for (int i = 1; i < 16; ++i) UsbBtDiagnostic[i] = 0;
   Log("bt-adapter attached");
 #if USB_AUDIO360_BT_CLAIM_ONLY
@@ -566,23 +685,95 @@ void ScanTick() {
   else if (g_scanner.stage() == bt::kStageFailed) Fail(kErrScan, 0);
 }
 
+Request TakeRequest() {
+  Request request = {kRequestNone};
+  EnterCriticalSection(&g_ui_lock);
+  request = g_request;
+  g_request.kind = kRequestNone;
+  LeaveCriticalSection(&g_ui_lock);
+  return request;
+}
+
+void HandleRequest(const Request& request, DWORD now) {
+  char text[18];
+  bt::FormatAddress(request.address, text);
+  switch (request.kind) {
+    case kRequestPair: {
+      if (g_link.busy()) return;
+      const bt::Device* found = 0;
+      for (unsigned i = 0; i < g_scanner.device_count(); ++i)
+        if (!memcmp(g_scanner.devices()[i].address, request.address, 6))
+          found = &g_scanner.devices()[i];
+      if (!found) return;
+      memcpy(g_pairing_name, found->name, sizeof(g_pairing_name));
+      Log("bt-link pair requested addr=%s", text);
+      g_link.Connect(*found, now);
+      break;
+    }
+    case kRequestToggle: {
+      if (g_link.busy()) {
+        if (!memcmp(g_link.address(), request.address, 6)) {
+          Log("bt-link disconnect requested addr=%s", text);
+          g_link.Disconnect(now);
+        }
+        return;
+      }
+      const bt::PairedDevice* d = g_paired.Find(request.address);
+      if (!d) return;
+      memcpy(g_pairing_name, d->name, sizeof(g_pairing_name));
+      Log("bt-link connect requested addr=%s", text);
+      g_link.Connect(request.address, now);
+      break;
+    }
+    case kRequestForget:
+      if (g_link.busy() && !memcmp(g_link.address(), request.address, 6))
+        g_link.Disconnect(now);
+      if (g_paired.Remove(request.address)) {
+        Log("bt-paired forgot addr=%s", text);
+        SavePaired();
+      }
+      break;
+  }
+}
+
 void FinishedTick() {
-  // Keep the event pipe serviced so the controller is never left with
-  // undelivered events; nothing else is submitted until a rescan request.
+  // The controller is set up; the link layer owns it until the next search.
+  DWORD now = GetTickCount();
   if (g_event_fault) { Fail(kErrEventStatus, g_event_fault_status); return; }
-  if (InterlockedExchange(&g_scan_request, 0) &&
-      g_scanner.Rescan(GetTickCount())) {
-    g_events.Clear();
-    g_assembler.Reset();
+  if (!g_event_pending) {
+    MemoryBarrier();
+    DrainEvents(now);
+    if (!QueueEvent()) return;
+  }
+  DrainEvents(now);
+  Request request = TakeRequest();
+  if (request.kind != kRequestNone) HandleRequest(request, now);
+  if (!g_link.busy() && InterlockedExchange(&g_scan_request, 0) &&
+      g_scanner.Rescan(now)) {
     Log("bt-inquiry rescan requested");
     SetPhase(kPhaseScanning);
     return;
   }
-  if (!g_event_pending) {
-    MemoryBarrier();
-    g_events.Clear();
-    QueueEvent();
+  if (g_control_pending) {
+    int result = PollControl(0);
+    if (result < 0) { g_link.Abort(0); return; }
   }
+  if (!g_control_pending) {
+    BYTE command[bt::kMaxCommandBytes];
+    unsigned n = g_link.NextCommand(command, sizeof(command));
+    if (n) {
+      memcpy(g_control_buffer, command, n);
+      if (!QueueControl(0x20, 0, 0, 0, (WORD)n)) {
+        g_link.Abort(0);
+        return;
+      }
+      g_link.CommandSent(now);
+      ++UsbBtDiagnostic[kDiagCommandsSent];
+    }
+  }
+  g_link.Tick(now);
+  UsbBtDiagnostic[kDiagUnhandled] =
+      g_scanner.unhandled_events() + g_link.unhandled_events();
 }
 
 void RearmTick() {
@@ -604,6 +795,7 @@ void RearmTick() {
   g_control_pending = false;
   InterlockedExchange(&g_event_pending, 0);
   InterlockedExchange(&g_removed, 0);
+  g_link.Reset();  // The controller and its links are gone.
   SetPhase(kPhaseIdle);
   Log("bt-adapter removed");
 }
@@ -639,6 +831,25 @@ void PublishUi(bool force) {
     if (n.address_valid) memcpy(n.address, local, 6);
     n.manufacturer = g_manufacturer;
   }
+  n.paired_count = g_paired.count();
+  for (unsigned i = 0; i < g_paired.count() && i < 3; ++i) {
+    memcpy(n.paired[i].address, g_paired.at(i).address, 6);
+    memcpy(n.paired[i].name, g_paired.at(i).name, sizeof(n.paired[i].name));
+    n.paired[i].name[sizeof(n.paired[i].name) - 1] = 0;
+  }
+  if (n.status != kBluetoothNoAdapter && g_link.busy()) {
+    switch (g_link.state()) {
+      case bt::kLinkConnected: n.link = kBluetoothLinkConnected; break;
+      case bt::kLinkDisconnecting: n.link = kBluetoothLinkDisconnecting; break;
+      default: n.link = kBluetoothLinkConnecting; break;
+    }
+    memcpy(n.link_address, g_link.address(), 6);
+    n.link_paired_now = g_link.paired_now() ? TRUE : FALSE;
+  }
+  n.link_result_count = g_link_result_count;
+  n.link_failure = g_link_failure;
+  n.link_status = g_link_status;
+  memcpy(n.result_address, g_result_address, 6);
   if (n.status == kBluetoothScanning || n.status == kBluetoothReady) {
     // kBluetoothIdle has no list: nothing has been searched yet.
     unsigned count = g_scanner.device_count();
@@ -735,6 +946,18 @@ VOID BluetoothRequestScan() {
   InterlockedExchange(&g_scan_request, 1);
 }
 
+static VOID PostRequest(LONG kind, const BYTE* address) {
+  if (!g_ui_ready || !address) return;
+  EnterCriticalSection(&g_ui_lock);
+  g_request.kind = kind;
+  memcpy(g_request.address, address, 6);
+  LeaveCriticalSection(&g_ui_lock);
+}
+
+VOID BluetoothRequestPair(const BYTE* address) { PostRequest(kRequestPair, address); }
+VOID BluetoothRequestToggle(const BYTE* address) { PostRequest(kRequestToggle, address); }
+VOID BluetoothRequestForget(const BYTE* address) { PostRequest(kRequestForget, address); }
+
 BOOL BluetoothAdapterPresent() {
   BluetoothUiState state;
   return BluetoothGetUiState(&state) && state.status != kBluetoothNoAdapter;
@@ -747,6 +970,9 @@ DWORD WINAPI BluetoothWorker(void*) {
   MemoryBarrier();
   InterlockedExchange(&g_ui_ready, 1);
   for (;;) {
+    // Show saved pairings even before an adapter is plugged in.
+    if (!g_paired_loaded && DiagnosticsSettingsPath(g_paired_text, MAX_PATH))
+      LoadPaired();
     Tick();
     Sleep(g_phase == kPhaseScanning || g_phase == kPhaseConfig ||
           g_phase == kPhaseConfigHeader || g_phase == kPhaseSetConfig ||

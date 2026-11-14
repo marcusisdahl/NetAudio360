@@ -32,6 +32,16 @@ struct BluetoothUiDevice {
   BOOL has_rssi;
   char name[64];            // UTF-8; empty while unknown.
 };
+enum BluetoothUiLink {
+  kBluetoothLinkNone = 0,
+  kBluetoothLinkConnecting = 1,  // Paging, pairing or encrypting.
+  kBluetoothLinkConnected = 2,
+  kBluetoothLinkDisconnecting = 3
+};
+struct BluetoothUiPaired {
+  BYTE address[6];
+  char name[64];            // UTF-8; may be empty.
+};
 struct BluetoothUiState {
   DWORD sequence;           // Changes whenever anything below changes.
   DWORD status;             // BluetoothUiStatus.
@@ -41,12 +51,27 @@ struct BluetoothUiState {
   DWORD error;
   DWORD device_count;
   BluetoothUiDevice devices[16];
+  DWORD paired_count;
+  BluetoothUiPaired paired[3];
+  DWORD link;               // BluetoothUiLink for link_address.
+  BYTE link_address[6];
+  BOOL link_paired_now;     // The current link was just paired.
+  DWORD link_result_count;  // Increments when an attempt ends.
+  DWORD link_failure;       // bt::LinkFailure of the last attempt (0 = ok).
+  DWORD link_status;        // HCI status/reason of the last attempt.
+  BYTE result_address[6];
 };
 BOOL BluetoothGetUiState(BluetoothUiState* state);
 // Starts a ~10 s search ("Pair new device"); the adapter never scans
 // otherwise. Ignored while setup or another search is running.
 VOID BluetoothRequestScan();
 BOOL BluetoothAdapterPresent();
+// Pairs with a device from the last search (by address), connects to or
+// disconnects from a paired device, or forgets one. Ignored while the adapter
+// is busy with something else; the UI state shows the outcome.
+VOID BluetoothRequestPair(const BYTE* address);
+VOID BluetoothRequestToggle(const BYTE* address);
+VOID BluetoothRequestForget(const BYTE* address);
 
 // Passive worker thread that owns all Bluetooth USB submissions.
 DWORD WINAPI BluetoothWorker(void*);

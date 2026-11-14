@@ -45,6 +45,8 @@ enum Opcode {
   kOpSetEventMask = 0x0C01,
   kOpReset = 0x0C03,
   kOpWriteInquiryMode = 0x0C45,
+  kOpWriteLocalName = 0x0C13,
+  kOpWriteSimplePairingMode = 0x0C56,
   kOpReadLocalVersion = 0x1001,
   kOpReadBdAddr = 0x1009
 };
@@ -177,6 +179,8 @@ enum Stage {
   kStageReadAddress,
   kStageEventMask,
   kStageInquiryMode,
+  kStageSimplePairing,  // Write_Simple_Pairing_Mode(1); warning on failure.
+  kStageLocalName,      // Write_Local_Name; warning on failure.
   kStageInquiry,
   kStageNames,
   kStageDone,
@@ -212,14 +216,16 @@ class ScanObserver {
 };
 
 // Drives Reset -> Read_Local_Version -> Read_BD_ADDR -> Set_Event_Mask ->
-// Write_Inquiry_Mode -> Inquiry -> Remote_Name_Request (for devices without
-// an EIR name). One command in flight; honours Num_HCI_Command_Packets.
+// Write_Inquiry_Mode -> Write_Simple_Pairing_Mode -> Write_Local_Name ->
+// Inquiry -> Remote_Name_Request (for devices without an EIR name). One command in flight; honours Num_HCI_Command_Packets.
 // Time is a caller-supplied millisecond tick (wrap-safe arithmetic).
 class Scanner {
  public:
   static const unsigned kCommandTimeoutMs = 5000;
   static const unsigned kNameTimeoutMs = 15000;
   static const u8 kInquiryLength = 8;  // x 1.28 s = 10.24 s.
+  // Shown on headphones that announce or list their source.
+  static const char* LocalName() { return "Xbox 360"; }
 
   explicit Scanner(ScanObserver* observer);
   // Resets and configures the controller. With inquire false it stops in

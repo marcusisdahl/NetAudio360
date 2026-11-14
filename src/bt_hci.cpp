@@ -11,8 +11,12 @@ u16 Le16(const u8* p) { return (u16)(p[0] | (p[1] << 8)); }
 u32 Le24(const u8* p) { return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16); }
 
 // Default event mask (Core Vol 4 Part E 7.3.1) plus Extended Inquiry Result
-// (bit 46). Inquiry Result with RSSI (bit 33) is already in the default.
-const u8 kEventMask[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x5F, 0x00, 0x00};
+// (bit 46), Encryption Key Refresh Complete (47), the Secure Simple Pairing
+// events (48-53: IO Capability Request/Response, User Confirmation/Passkey
+// Request, Remote OOB Data Request, Simple Pairing Complete), Link
+// Supervision Timeout Changed (55), User Passkey Notification (58), Keypress
+// Notification (59) and Remote Host Supported Features Notification (60).
+const u8 kEventMask[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xDF, 0xBF, 0x1C};
 // General/Unlimited Inquiry Access Code 0x9E8B33, little-endian.
 const u8 kGiac[3] = {0x33, 0x8B, 0x9E};
 const unsigned kInquiryUnitMs = 1280;
@@ -169,7 +173,8 @@ void FormatAddress(const u8* a, char* out) {
 const char* StageName(unsigned stage) {
   static const char* names[] = {
     "idle", "reset", "read-version", "read-address", "event-mask",
-    "inquiry-mode", "inquiry", "names", "done", "failed"
+    "inquiry-mode", "simple-pairing", "local-name", "inquiry", "names",
+    "done", "failed"
   };
   return stage < sizeof(names) / sizeof(names[0]) ? names[stage] : "unknown";
 }
@@ -247,7 +252,7 @@ void Scanner::Abort(unsigned failure, u8 status) {
 
 unsigned Scanner::NextCommand(u8* out, unsigned capacity) {
   if (finished() || !command_ready_ || pending_opcode_ || !credits_) return 0;
-  u8 params[16];
+  u8 params[248];
   u8 length = 0;
   u16 opcode = 0;
   switch (stage_) {
@@ -264,6 +269,19 @@ unsigned Scanner::NextCommand(u8* out, unsigned capacity) {
       params[0] = inquiry_mode_;
       length = 1;
       break;
+    case kStageSimplePairing:
+      opcode = kOpWriteSimplePairingMode;
+      params[0] = 1;
+      length = 1;
+      break;
+    case kStageLocalName: {
+      opcode = kOpWriteLocalName;
+      memset(params, 0, 248);
+      const char* name = LocalName();
+      memcpy(params, name, strlen(name));
+      length = 248;
+      break;
+    }
     case kStageInquiry:
       opcode = kOpInquiry;
       memcpy(params, kGiac, 3);
@@ -392,6 +410,15 @@ bool Scanner::OnCommandComplete(const u8* p, unsigned n, unsigned now) {
         }
         // Fall through to inquiry using the controller's default mode.
       }
+      Advance(kStageSimplePairing, now);
+      break;
+    case kStageSimplePairing:
+      // Without SSP the controller falls back to legacy PIN pairing.
+      if (status && observer_) observer_->OnWarning(stage_, opcode, status);
+      Advance(kStageLocalName, now);
+      break;
+    case kStageLocalName:
+      if (status && observer_) observer_->OnWarning(stage_, opcode, status);
       if (!inquire_on_start_) {
         stage_ = kStageDone;  // Controller ready; scanning waits for Rescan.
         deadline_armed_ = false;

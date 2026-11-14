@@ -80,6 +80,20 @@ void CommandStatus(Scanner& s, u16 opcode, u8 status, unsigned now) {
   Feed(s, e, now);
 }
 
+// Write_Simple_Pairing_Mode(1) and Write_Local_Name("Xbox 360"), each
+// answered with the given status.
+void SetupTail(Scanner& s, unsigned* now, u8 ssp_status, u8 name_status) {
+  const u8 ssp[] = {0x56, 0x0C, 0x01, 0x01};
+  ExpectCommand(s, ssp, sizeof(ssp), *now);
+  CommandComplete(s, kOpWriteSimplePairingMode, &ssp_status, 1, ++*now);
+  u8 name[3 + 248];
+  memset(name, 0, sizeof(name));
+  name[0] = 0x13; name[1] = 0x0C; name[2] = 248;
+  memcpy(name + 3, "Xbox 360", 8);
+  ExpectCommand(s, name, sizeof(name), *now);
+  CommandComplete(s, kOpWriteLocalName, &name_status, 1, ++*now);
+}
+
 const u8 kBose[6] = {0x11, 0x22, 0x33, 0x5D, 0x87, 0x4C};
 const u8 kPhone[6] = {0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6};
 const u8 kLocal[6] = {0x01, 0x02, 0x03, 0x7D, 0x1A, 0x00};
@@ -107,13 +121,14 @@ void RunSetup(Scanner& s, Recorder& r, unsigned* now, bool inquire = true) {
   CommandComplete(s, kOpReadBdAddr, addr_ret, 7, ++*now);
   assert(r.addresses == 1 && !memcmp(s.local_address(), kLocal, 6));
 
-  const u8 mask[] = {0x01, 0x0C, 0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x5F, 0, 0};
+  const u8 mask[] = {0x01, 0x0C, 0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xDF, 0xBF, 0x1C};
   ExpectCommand(s, mask, sizeof(mask), *now);
   CommandComplete(s, kOpSetEventMask, ok, 1, ++*now);
 
   const u8 mode[] = {0x45, 0x0C, 0x01, 0x02};
   ExpectCommand(s, mode, sizeof(mode), *now);
   CommandComplete(s, kOpWriteInquiryMode, ok, 1, ++*now);
+  SetupTail(s, now, 0, 0);
   assert(s.stage() == (inquire ? kStageInquiry : kStageDone));
 }
 
@@ -386,7 +401,10 @@ void TestInquiryModeFallbackAndFailures() {
   const u8 mode1[] = {0x45, 0x0C, 0x01, 0x01};
   ExpectCommand(s, mode1, 4, now);
   CommandComplete(s, kOpWriteInquiryMode, unknown, 1, ++now);
-  assert(s.stage() == kStageInquiry && r.warnings == 3);
+  assert(s.stage() == kStageSimplePairing && r.warnings == 3);
+  // SSP and local name failures are warnings too.
+  SetupTail(s, &now, 0x01, 0x01);
+  assert(s.stage() == kStageInquiry && r.warnings == 5);
 
   s.NextCommand(out, sizeof(out)); s.CommandSent(now);
   CommandStatus(s, kOpInquiry, 0, ++now);

@@ -122,3 +122,10 @@ rm -f "$test_dir/playback_pacer_tests"
   "$project_root/tests/bt_hci_test.cpp" -o "$test_dir/bt_hci_tests"
 "$test_dir/bt_hci_tests"
 rm -f "$test_dir/bt_hci_tests"
+"$compiler" -std=c++98 -Wall -Wextra -Werror -pedantic \
+  -fsanitize=address,undefined -fno-omit-frame-pointer -g \
+  -I"$project_root/src" "$project_root/src/bt_hci.cpp" \
+  "$project_root/src/bt_link.cpp" "$project_root/tests/bt_link_test.cpp" \
+  -o "$test_dir/bt_link_tests"
+"$test_dir/bt_link_tests"
+rm -f "$test_dir/bt_link_tests"

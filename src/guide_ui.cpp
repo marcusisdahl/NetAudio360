@@ -230,14 +230,20 @@ const DWORD kSettingsRefreshTimer = 0x55534253;
 const DWORD kVolumeRefreshTimer = 0x55534256;
 const DWORD kBluetoothRefreshTimer = 0x55534254;
 const unsigned kBluetoothButtons = 6;
+const unsigned kBluetoothPairedButtons = 3;
 
 struct BluetoothScene {
   HXUIOBJ object;
   HXUIOBJ back_button, adapter_text, status_text, scan_button;
+  HXUIOBJ forget_button, paired_text;
   HXUIOBJ devices[kBluetoothButtons];
+  HXUIOBJ paired[kBluetoothPairedButtons];
   BluetoothUiState ui;
   bool have_state;
+  bool have_seen_results;
   unsigned shown;
+  unsigned paired_shown;
+  DWORD seen_results;  // link_result_count already turned into a notice.
   WCHAR notice[160];
   DWORD notice_until;
   BYTE user;
@@ -933,15 +939,58 @@ LPCWSTR DeviceKind(DWORD cod) {
   }
 }
 
-void SetBluetoothNavigation(BluetoothScene* state, unsigned shown) {
+void SetBluetoothNavigation(BluetoothScene* state, unsigned shown,
+                            unsigned paired) {
   WCHAR up[16], down[16];
+  LPCWSTR left_target = paired ? L"BtPaired0" : L"BtScanButton";
   for (unsigned i = 0; i < shown; ++i) {
     _snwprintf_s(up, _countof(up), _TRUNCATE, L"BtDevice%u", i ? i - 1 : 0);
     _snwprintf_s(down, _countof(down), _TRUNCATE, L"BtDevice%u", i + 1 < shown ? i + 1 : i);
     SetString(state->devices[i], L"NavUp", up);
     SetString(state->devices[i], L"NavDown", down);
+    SetString(state->devices[i], L"NavLeft", left_target);
+  }
+  LPCWSTR right_target = shown ? L"BtDevice0" : 0;
+  for (unsigned i = 0; i < paired; ++i) {
+    _snwprintf_s(up, _countof(up), _TRUNCATE, L"BtPaired%u", i ? i - 1 : 0);
+    if (i + 1 < paired)
+      _snwprintf_s(down, _countof(down), _TRUNCATE, L"BtPaired%u", i + 1);
+    else
+      wcscpy_s(down, L"BtScanButton");
+    SetString(state->paired[i], L"NavUp", up);
+    SetString(state->paired[i], L"NavDown", down);
+    if (right_target) SetString(state->paired[i], L"NavRight", right_target);
+    else {
+      WCHAR self[16];
+      _snwprintf_s(self, _countof(self), _TRUNCATE, L"BtPaired%u", i);
+      SetString(state->paired[i], L"NavRight", self);
+    }
+  }
+  if (paired) {
+    _snwprintf_s(up, _countof(up), _TRUNCATE, L"BtPaired%u", paired - 1);
+    SetString(state->scan_button, L"NavUp", up);
+  } else {
+    SetString(state->scan_button, L"NavUp", L"BtScanButton");
   }
   SetString(state->scan_button, L"NavRight", shown ? L"BtDevice0" : L"BtScanButton");
+}
+
+bool SameAddress(const BYTE* a, const BYTE* b) { return memcmp(a, b, 6) == 0; }
+
+void PairedLabel(const BluetoothUiPaired& p, WCHAR* out, size_t capacity) {
+  if (p.name[0]) Utf8ToWide(p.name, out, capacity);
+  else FormatAddress(p.address, out, capacity);
+}
+
+// Short reason for a failed attempt (HCI status codes, Core Vol 1 Part F).
+LPCWSTR LinkFailureText(DWORD failure, DWORD status) {
+  if (failure == 3 && status == 0x04) return L"it didn't answer. Is it on and nearby?";
+  if (failure == 4 && (status == 0x05 || status == 0x06))
+    return L"it refused the pairing. Put it in pairing mode and pair again.";
+  if (failure == 4 || failure == 5) return L"pairing failed.";
+  if (failure == 2) return L"it took too long.";
+  if (failure == 6) return L"it disconnected.";
+  return L"the adapter reported an error.";
 }
 
 void RefreshBluetooth(BluetoothScene* state, bool force) {
@@ -966,8 +1015,37 @@ void RefreshBluetooth(BluetoothScene* state, bool force) {
   g_xui.set_text(state->adapter_text, text);
 
   unsigned count = ui.device_count < kBluetoothButtons ? ui.device_count : kBluetoothButtons;
+  if (ui.link_result_count != state->seen_results) {
+    // An attempt just ended: say how, for a few seconds.
+    state->seen_results = ui.link_result_count;
+    if (state->have_seen_results) {
+      WCHAR name[64] = L"the device";
+      for (unsigned i = 0; i < ui.paired_count && i < 3; ++i)
+        if (SameAddress(ui.paired[i].address, ui.result_address))
+          PairedLabel(ui.paired[i], name, _countof(name));
+      for (unsigned i = 0; i < ui.device_count && i < 16; ++i)
+        if (SameAddress(ui.devices[i].address, ui.result_address) && ui.devices[i].name[0])
+          Utf8ToWide(ui.devices[i].name, name, _countof(name));
+      if (ui.link_failure == 0)
+        _snwprintf_s(state->notice, _countof(state->notice), _TRUNCATE,
+                     L"Connected to %.40s.", name);
+      else
+        _snwprintf_s(state->notice, _countof(state->notice), _TRUNCATE,
+                     L"Couldn't connect to %.40s: %s (%02X)", name,
+                     LinkFailureText(ui.link_failure, ui.link_status), ui.link_status);
+      state->notice_until = GetTickCount() + 6000;
+      notice = true;
+    }
+  }
+  state->have_seen_results = true;
   if (notice) {
     wcscpy_s(text, state->notice);
+  } else if (ui.link == kBluetoothLinkConnecting) {
+    wcscpy_s(text, ui.link_paired_now
+        ? L"Paired. Finishing the connection..."
+        : L"Connecting... If this is a new device, keep it in pairing mode.");
+  } else if (ui.link == kBluetoothLinkConnected) {
+    wcscpy_s(text, L"Connected. Audio over Bluetooth arrives in a later update.");
   } else {
     switch (ui.status) {
       case kBluetoothStarting: wcscpy_s(text, L"Starting the adapter..."); break;
@@ -994,7 +1072,8 @@ void RefreshBluetooth(BluetoothScene* state, bool force) {
   }
   g_xui.set_text(state->status_text, text);
   SetBool(state->scan_button, L"Enabled",
-          ui.status == kBluetoothReady || ui.status == kBluetoothIdle);
+          (ui.status == kBluetoothReady || ui.status == kBluetoothIdle) &&
+          ui.link == kBluetoothLinkNone);
 
   HXUIOBJ focus = g_xui.tree_focus(state->object);
   for (unsigned i = 0; i < kBluetoothButtons; ++i) {
@@ -1002,10 +1081,15 @@ void RefreshBluetooth(BluetoothScene* state, bool force) {
     if (show) {
       const BluetoothUiDevice& d = ui.devices[i];
       WCHAR name[64];
-      if (d.name[0]) Utf8ToWide(d.name, name, _countof(name));
-      else FormatAddress(d.address, name, _countof(name));
-      _snwprintf_s(text, _countof(text), _TRUNCATE, L"%.40s  (%s)", name,
-                   DeviceKind(d.class_of_device));
+      if (d.name[0]) {
+        // The name alone fits the row; the device kind made it truncate.
+        Utf8ToWide(d.name, name, _countof(name));
+        _snwprintf_s(text, _countof(text), _TRUNCATE, L"%s", name);
+      } else {
+        FormatAddress(d.address, name, _countof(name));
+        _snwprintf_s(text, _countof(text), _TRUNCATE, L"%s  (%s)", name,
+                     DeviceKind(d.class_of_device));
+      }
       // Buttons take their label through the Text property; set_text only
       // updates text elements (the label stayed blank on COD).
       SetString(state->devices[i], L"Text", text);
@@ -1015,9 +1099,33 @@ void RefreshBluetooth(BluetoothScene* state, bool force) {
     SetBool(state->devices[i], L"Show", show);
     SetBool(state->devices[i], L"Enabled", show);
   }
-  if (count != state->shown || force) {
-    SetBluetoothNavigation(state, count);
+  // Paired devices: name plus link state; pressing toggles the connection.
+  unsigned paired = ui.paired_count < kBluetoothPairedButtons
+      ? ui.paired_count : kBluetoothPairedButtons;
+  for (unsigned i = 0; i < kBluetoothPairedButtons; ++i) {
+    bool show = i < paired;
+    if (show) {
+      WCHAR name[64];
+      PairedLabel(ui.paired[i], name, _countof(name));
+      LPCWSTR suffix = L"";
+      if (ui.link != kBluetoothLinkNone && SameAddress(ui.link_address, ui.paired[i].address)) {
+        suffix = ui.link == kBluetoothLinkConnected ? L"  - Connected"
+               : ui.link == kBluetoothLinkDisconnecting ? L"  - Disconnecting..."
+               : L"  - Connecting...";
+      }
+      _snwprintf_s(text, _countof(text), _TRUNCATE, L"%.40s%s", name, suffix);
+      SetString(state->paired[i], L"Text", text);
+    } else if (focus == state->paired[i]) {
+      g_xui.set_user_focus(state->scan_button, g_xui.focus_user(focus));
+    }
+    SetBool(state->paired[i], L"Show", show);
+    SetBool(state->paired[i], L"Enabled", show && ui.status != kBluetoothNoAdapter);
+  }
+  SetBool(state->paired_text, L"Show", paired == 0);
+  if (count != state->shown || paired != state->paired_shown || force) {
+    SetBluetoothNavigation(state, count, paired);
     state->shown = count;
+    state->paired_shown = paired;
   }
 }
 
@@ -1043,8 +1151,16 @@ HRESULT APIENTRY BluetoothObjectProc(HXUIOBJ object, XUIMessage* message,
       state->devices[i] = Find(object, id);
       if (!state->devices[i]) return E_FAIL;
     }
+    for (unsigned i = 0; i < kBluetoothPairedButtons; ++i) {
+      _snwprintf_s(id, _countof(id), _TRUNCATE, L"BtPaired%u", i);
+      state->paired[i] = Find(object, id);
+      if (!state->paired[i]) return E_FAIL;
+    }
+    state->forget_button = Find(object, L"BtForgetButton");
+    state->paired_text = Find(object, L"BtPairedValue");
     if (!state->back_button || !state->adapter_text || !state->status_text ||
-        !state->scan_button) return E_FAIL;
+        !state->scan_button || !state->forget_button || !state->paired_text)
+      return E_FAIL;
     RefreshBluetooth(state, true);
     return g_xui.set_timer(object, kBluetoothRefreshTimer, 250);
   } else if (message->dwMessage == XM_TIMER && message->pvData &&
@@ -1075,6 +1191,24 @@ HRESULT APIENTRY BluetoothObjectProc(HXUIOBJ object, XUIMessage* message,
       state->notice_until = GetTickCount() + 1500;
       RefreshBluetooth(state, true);
       message->bHandled = TRUE;
+    } else if (notify->hObjSource == state->forget_button) {
+      // X on a focused paired device forgets it.
+      HXUIOBJ focus = g_xui.tree_focus(object);
+      bool done = false;
+      for (unsigned i = 0; i < state->paired_shown; ++i) {
+        if (focus != state->paired[i]) continue;
+        WCHAR name[64];
+        PairedLabel(state->ui.paired[i], name, _countof(name));
+        BluetoothRequestForget(state->ui.paired[i].address);
+        _snwprintf_s(state->notice, _countof(state->notice), _TRUNCATE,
+                     L"Forgot %.40s.", name);
+        done = true;
+      }
+      if (!done)
+        wcscpy_s(state->notice, L"Select a paired device, then press X to forget it.");
+      state->notice_until = GetTickCount() + 3000;
+      RefreshBluetooth(state, true);
+      message->bHandled = TRUE;
     } else {
       for (unsigned i = 0; i < state->shown; ++i) {
         if (notify->hObjSource != state->devices[i]) continue;
@@ -1082,9 +1216,29 @@ HRESULT APIENTRY BluetoothObjectProc(HXUIOBJ object, XUIMessage* message,
         const BluetoothUiDevice& d = state->ui.devices[i];
         if (d.name[0]) Utf8ToWide(d.name, name, _countof(name));
         else FormatAddress(d.address, name, _countof(name));
-        _snwprintf_s(state->notice, _countof(state->notice), _TRUNCATE,
-                     L"Pairing with %.40s arrives in the next update.", name);
-        state->notice_until = GetTickCount() + 4000;
+        if (state->ui.link != kBluetoothLinkNone) {
+          wcscpy_s(state->notice, L"Disconnect the current device first.");
+        } else {
+          BluetoothRequestPair(d.address);
+          _snwprintf_s(state->notice, _countof(state->notice), _TRUNCATE,
+                       L"Pairing with %.40s...", name);
+        }
+        state->notice_until = GetTickCount() + 2000;
+        RefreshBluetooth(state, true);
+        message->bHandled = TRUE;
+        break;
+      }
+      for (unsigned i = 0; i < state->paired_shown; ++i) {
+        if (notify->hObjSource != state->paired[i]) continue;
+        const BluetoothUiPaired& p = state->ui.paired[i];
+        bool this_link = state->ui.link != kBluetoothLinkNone &&
+            SameAddress(state->ui.link_address, p.address);
+        if (state->ui.link != kBluetoothLinkNone && !this_link) {
+          wcscpy_s(state->notice, L"Disconnect the current device first.");
+          state->notice_until = GetTickCount() + 2000;
+        } else {
+          BluetoothRequestToggle(p.address);
+        }
         RefreshBluetooth(state, true);
         message->bHandled = TRUE;
         break;
@@ -1119,7 +1273,10 @@ HXUIOBJ CreateBluetoothPanel() {
     {XUI_CLASS_TEXT, L"BtAdapterValue", 154, 76, 540, 22, L"Bluetooth adapter", 0, 11},
     {XUI_CLASS_TEXT, L"BtPairedHeading", 154, 109, 240, 24, L"Paired devices", 0, 14},
     {XUI_CLASS_TEXT, L"BtPairedValue", 154, 145, 240, 60,
-     L"No paired devices yet. Pairing arrives in the next update.", 0, 11},
+     L"No paired devices yet. Select a device on the right to pair it.", 0, 11},
+    {XUI_CLASS_BUTTON, L"BtPaired0", 144, 139, 260, 28, L"", L"XuiButtonGuide", 12},
+    {XUI_CLASS_BUTTON, L"BtPaired1", 144, 173, 260, 28, L"", L"XuiButtonGuide", 12},
+    {XUI_CLASS_BUTTON, L"BtPaired2", 144, 207, 260, 28, L"", L"XuiButtonGuide", 12},
     {XUI_CLASS_TEXT, L"BtAvailableHeading", 454, 109, 240, 24, L"Available devices", 0, 14},
     {XUI_CLASS_BUTTON, L"BtDevice0", 444, 139, 260, 28, L"", L"XuiButtonGuide", 12},
     {XUI_CLASS_BUTTON, L"BtDevice1", 444, 173, 260, 28, L"", L"XuiButtonGuide", 12},
@@ -1128,13 +1285,16 @@ HXUIOBJ CreateBluetoothPanel() {
     {XUI_CLASS_BUTTON, L"BtDevice4", 444, 275, 260, 28, L"", L"XuiButtonGuide", 12},
     {XUI_CLASS_BUTTON, L"BtDevice5", 444, 309, 260, 28, L"", L"XuiButtonGuide", 12},
     {XUI_CLASS_BUTTON, L"BtScanButton", 144, 352, 260, 28, L"Pair new device", L"XuiButtonGuide", 12},
-    {XUI_CLASS_TEXT, L"BtStatus", 154, 230, 240, 100, L"", 0, 10},
+    {XUI_CLASS_TEXT, L"BtStatus", 154, 248, 240, 96, L"", 0, 10},
     // Input-only B handler; the Guide shell supplies the visible Back legend.
     {XUI_CLASS_BUTTON, L"BtBackButton", 0, 0, 0, 0, 0, 0, 0},
+    // Input-only X handler: forget the focused paired device.
+    {XUI_CLASS_BUTTON, L"BtForgetButton", 0, 0, 0, 0, 0, 0, 0},
     {XUI_CLASS_FIGURE, L"BtDivider", 424, 110, 1, 279, 0, 0, 0}
   };
   const unsigned count = _countof(elements);
-  const unsigned first_device = 5, scan = 11, back = 13, divider = 14;
+  const unsigned first_paired = 4, first_device = 8, scan = 14, back = 16,
+                 forget = 17, divider = 18;
   HXUIOBJ scene = 0, children[_countof(elements)] = {0};
   unsigned owned = 0;
   if (g_xui.create(L"UsbAudioBluetoothScene", &scene) < 0 || !scene) goto fail;
@@ -1154,6 +1314,16 @@ HXUIOBJ CreateBluetoothPanel() {
           !SetUint(children[i], L"TextStyle", 0, false)) goto fail;
     }
   }
+  for (unsigned i = first_paired; i < first_paired + kBluetoothPairedButtons; ++i) {
+    if (!SetString(children[i], L"NavLeft", elements[i].id) ||
+        !SetString(children[i], L"NavRight", elements[i].id) ||
+        !SetBool(children[i], L"Show", FALSE) ||
+        !SetBool(children[i], L"Enabled", FALSE)) goto fail;
+  }
+  if (!SetUint(children[forget], L"PressKey", VK_PAD_X, false) ||
+      !SetBool(children[forget], L"UnfocusedInput", TRUE)) goto fail;
+  // Optional: older shells may not have an X legend slot.
+  SetString(scene, L"LegendX", L"Forget");
   for (unsigned i = first_device; i < first_device + kBluetoothButtons; ++i) {
     if (!SetString(children[i], L"NavLeft", L"BtScanButton") ||
         !SetString(children[i], L"NavRight", elements[i].id) ||
