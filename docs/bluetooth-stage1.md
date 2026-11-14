@@ -94,7 +94,7 @@ Use a build without other changes. Check the DashLaunch plugin slot and the
 | Index | Meaning |
 | --- | --- |
 | 0 | marker `0x55414254` |
-| 1 | worker phase (0 idle, 1–2 config, 3 scanning, 4 finished, 5 failed, 6 re-arm) |
+| 1 | worker phase (0 idle, 1–2 config, 3 scanning, 4 finished, 5 failed, 6 re-arm, 7 set-config, 8 get-config) |
 | 2 | scanner stage (`bt::Stage`) |
 | 3 | event TRB completions |
 | 4 | last event completion status |
@@ -171,6 +171,12 @@ reads a snapshot (`BluetoothGetUiState`) and never touches USB.
   `+0x10(node)` instead of export 751. Fix: the Bluetooth claim sets node+4
   to a plugin-owned descriptor before the original 740; its RemoveDevice
   clears node+4 and calls export 751, which reaches the existing remove hook.
+
+- With the descriptor fix (2ad47ea) the endpoint stayed open (slot
+  `0xe1ec7520`), both configuration-descriptor reads worked, and COD stayed
+  up. SET_CONFIGURATION then stalled (`0xc0051004`, OHCI CC 4). The worker
+  now asks GET_CONFIGURATION first, skips SET when the configuration is
+  already active, and treats a stalled SET as a warning.
 
 ## Next
 

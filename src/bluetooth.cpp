@@ -85,7 +85,8 @@ enum Phase {
   kPhaseFinished = 4,
   kPhaseFailed = 5,   // Stopped; storage retained until removal drains.
   kPhaseRearm = 6,
-  kPhaseSetConfig = 7
+  kPhaseSetConfig = 7,
+  kPhaseGetConfig = 8
 };
 
 enum Error {
@@ -147,6 +148,7 @@ static volatile LONG g_removed = 0;
 static volatile DWORD g_removed_at = 0;
 static volatile DWORD g_attached_at = 0;
 static bool g_settle_logged = false;
+static BYTE g_configuration = 0;
 static volatile LONG g_control_done = 0;
 static volatile LONG g_control_status = 0;
 static volatile DWORD g_control_actual = 0;
@@ -346,7 +348,10 @@ bool QueueControl(BYTE type, BYTE request, WORD value, WORD index,
 
 // Returns 1 when the pending control transfer completed successfully,
 // 0 while pending, -1 after failure (phase is already Failed).
-int PollControl(DWORD* actual) {
+// tolerate_status: a completed transfer with an error status returns 2 (with
+// *status) instead of failing the attachment.
+int PollControl(DWORD* actual, bool tolerate_status = false,
+                LONG* status_out = 0) {
   if (!g_control_pending) return -1;
   if (!g_control_done) {
     if (GetTickCount() - g_control_issued >= kControlDeadlineMs) {
@@ -359,6 +364,11 @@ int PollControl(DWORD* actual) {
   g_control_pending = false;
   LONG status = g_control_status;
   UsbBtDiagnostic[kDiagControlStatus] = (DWORD)status;
+  if (status_out) *status_out = status;
+  if (status != 0 && status != kOhciDataUnderrun && tolerate_status) {
+    if (actual) *actual = 0;
+    return 2;
+  }
   if (status != 0 && status != kOhciDataUnderrun) {
     Fail(kErrControlStatus, status);
     return -1;
@@ -453,7 +463,13 @@ void StartAttachment() {
 
 void ConfigTick() {
   DWORD actual = 0;
-  if (PollControl(&actual) <= 0) return;
+  LONG status = 0;
+  // GET/SET_CONFIGURATION failures are reported, not fatal: the CSR clone
+  // stalls SET_CONFIGURATION, apparently because the kernel's enumerator
+  // already selected the configuration.
+  const bool tolerate = g_phase == kPhaseGetConfig || g_phase == kPhaseSetConfig;
+  int polled = PollControl(&actual, tolerate, &status);
+  if (polled <= 0) return;
   if (g_phase == kPhaseConfigHeader) {
     if (actual < 4 || g_control_buffer[1] != 2) { Fail(kErrDescriptor, actual); return; }
     WORD total = (WORD)(g_control_buffer[2] | (g_control_buffer[3] << 8));
@@ -470,11 +486,25 @@ void ConfigTick() {
     }
     // Like the audio path: select the configuration before using any
     // non-default endpoint (bConfigurationValue at offset 5).
-    BYTE configuration = g_control_buffer[5];
-    SetPhase(kPhaseSetConfig);
-    Step("set-configuration");
-    QueueControl(0x00, 9, configuration, 0, 0);
+    g_configuration = g_control_buffer[5];
+    SetPhase(kPhaseGetConfig);
+    Step("get-active-configuration");
+    QueueControl(0x80, 8, 0, 0, 1);  // GET_CONFIGURATION
     return;
+  }
+  if (g_phase == kPhaseGetConfig) {
+    BYTE active = (polled == 1 && actual >= 1) ? g_control_buffer[0] : 0;
+    Log("bt-configuration wanted=%u active=%u status=0x%08x",
+        (unsigned)g_configuration, (unsigned)active, (unsigned)status);
+    if (active != g_configuration) {
+      SetPhase(kPhaseSetConfig);
+      Step("set-configuration");
+      QueueControl(0x00, 9, g_configuration, 0, 0);
+      return;
+    }
+  } else if (g_phase == kPhaseSetConfig && polled == 2) {
+    Log("bt-warning set-configuration status=0x%08x; continuing",
+        (unsigned)status);
   }
   const bt::HciEndpoints& e = g_endpoints;
   Log("bt-adapter interface=%u event=0x%02x/%u/interval%u acl_in=0x%02x/%u "
@@ -484,7 +514,7 @@ void ConfigTick() {
   g_event_length = e.event_max_packet;
   if (g_event_length > sizeof(g_event_buffer)) g_event_length = sizeof(g_event_buffer);
   Step("open-interrupt");
-  LONG status = UsbTransportOpen(g_handle, kUsbEndpointInterrupt,
+  status = UsbTransportOpen(g_handle, kUsbEndpointInterrupt,
                                  e.event_address, e.event_max_packet,
                                  e.event_interval ? e.event_interval : 1,
                                  &g_event_trb.trb.endpoint);
@@ -583,6 +613,7 @@ DWORD UiStatus() {
     case kPhaseConfigHeader:
     case kPhaseConfig:
     case kPhaseSetConfig:
+    case kPhaseGetConfig:
       return kBluetoothStarting;
     case kPhaseScanning:
       return g_scanner.stage() >= bt::kStageInquiry ? kBluetoothScanning
@@ -653,6 +684,7 @@ void Tick() {
     case kPhaseConfigHeader:
     case kPhaseConfig:
     case kPhaseSetConfig:
+    case kPhaseGetConfig:
       ConfigTick();
       break;
     case kPhaseScanning:
@@ -717,6 +749,7 @@ DWORD WINAPI BluetoothWorker(void*) {
   for (;;) {
     Tick();
     Sleep(g_phase == kPhaseScanning || g_phase == kPhaseConfig ||
-          g_phase == kPhaseConfigHeader || g_phase == kPhaseSetConfig ? 1 : 20);
+          g_phase == kPhaseConfigHeader || g_phase == kPhaseSetConfig ||
+          g_phase == kPhaseGetConfig ? 1 : 20);
   }
 }
