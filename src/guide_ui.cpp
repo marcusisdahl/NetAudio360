@@ -1006,7 +1006,9 @@ void RefreshBluetooth(BluetoothScene* state, bool force) {
       else FormatAddress(d.address, name, _countof(name));
       _snwprintf_s(text, _countof(text), _TRUNCATE, L"%.40s  (%s)", name,
                    DeviceKind(d.class_of_device));
-      g_xui.set_text(state->devices[i], text);
+      // Buttons take their label through the Text property; set_text only
+      // updates text elements (the label stayed blank on COD).
+      SetString(state->devices[i], L"Text", text);
     } else if (focus == state->devices[i]) {
       g_xui.set_user_focus(state->scan_button, g_xui.focus_user(focus));
     }
