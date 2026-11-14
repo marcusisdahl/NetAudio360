@@ -279,6 +279,22 @@ BOOL UsbTransportRearm() {
   return status >= 0 && request.result == 0;
 }
 
+namespace {
+VOID RunDetachedInDomain(void*, void* context, void*, void*) {
+  DomainRequest* r = (DomainRequest*)context;
+  if (!InDomain() || g_handle) { r->result = -1; return; }
+  r->routine(r->context);
+  r->result = 0;
+}
+}  // namespace
+
+LONG UsbTransportRunDetached(UsbDomainRoutine routine, void* context) {
+  if (!g_dispatch || !routine || CurrentIrql() != 0 || g_handle) return -3;
+  DomainRequest request = {routine, context, -4};
+  LONG wait_status = g_dispatch(RunDetachedInDomain, &request, g_processor, 0, 0);
+  return wait_status < 0 ? wait_status : request.result;
+}
+
 BOOL UsbTransportComplete(void* transfer) {
   UsbAudioDiagnostic[62] = Context();
   if (!InDomain()) { InterlockedExchange(&g_stopped, 1); return FALSE; }

@@ -46,7 +46,10 @@ const WORD kSupportedKernel = 17559;
 const DWORD kUsbDeviceStateTable = 0x801A8220;
 const DWORD kUsbHcdTable = 0x801A8230;
 const DWORD kGetInterfaceDescriptor = 0x800D8500;
-const DWORD kResetRootHubPort = 0x800D7D20;
+const DWORD kResetRootHubPort = 0x800D7D20;  // DeviceConnected(parent, port)
+// Kernel 17559 hub internals (docs/bluetooth-stage3.md, "Boot on a hub").
+const DWORD kDeviceDisconnected = 0x800D6798;  // DeviceDisconnected(parent, port)
+const DWORD kHubClassDriver = 0x801721EC;      // External hub class descriptor
 const DWORD kNodePoolBytes = 0x1000;
 const DWORD kVoiceBindingCategory = 1;
 const DWORD kVirtualVoiceDeviceId = 0xA7554D49;
@@ -501,6 +504,74 @@ static bool ReenumerateBootDevice() {
   return true;
 }
 
+// An adapter that sits behind an external hub at boot was enumerated and
+// closed (no driver) before this plugin loaded. Find the single driverless
+// device under a hub and replay the hub driver's own connection-change
+// handling for that one port (disconnect, then connect), so enumeration runs
+// again and reaches the add hook. Other ports - such as the USB stick that
+// holds this plugin - are never touched.
+#ifndef USB_AUDIO360_BT_HUB_BOOT_RECOVERY
+#define USB_AUDIO360_BT_HUB_BOOT_RECOVERY 1
+#endif
+static bool ValidateDisconnectRoutine() {
+  // The first four words are a generic prologue; words 5-8 are this
+  // routine's parent+8 / parent+0xE child walk.
+  static const DWORD kExpected[8] = {
+    0x7D8802A6, 0x9181FFF8, 0xFBC1FFE8, 0xFBE1FFF0,
+    0x9421FF90, 0x89230008, 0x3D40801B, 0x8963000E};
+  const volatile DWORD* code = (const volatile DWORD*)kDeviceDisconnected;
+  for (int i = 0; i < 8; ++i) if (code[i] != kExpected[i]) return false;
+  const volatile DWORD* hub = (const volatile DWORD*)kHubClassDriver;
+  return hub[2] == 0x00010900 && hub[3] == 0x800DA378;
+}
+struct HubTarget { DeviceHandle* hub; DWORD port; };
+static void HubReconnectInDomain(void* context) {
+  HubTarget* t = (HubTarget*)context;
+  ((ResetRootHubPortFn)kDeviceDisconnected)(t->hub, t->port);
+  ((ResetRootHubPortFn)kResetRootHubPort)(t->hub, t->port);
+}
+static BYTE* NodeAt(BYTE* pool, BYTE index) {
+  return index == 0xFF ? 0 : pool + (DWORD)index * 16;
+}
+static bool ReenumerateHubDevice() {
+#if USB_AUDIO360_BLUETOOTH && USB_AUDIO360_BT_HUB_BOOT_RECOVERY
+  if (g_playback_handle || g_bluetooth_handle || !g_device_gate.available() ||
+      !ValidateResetRoutine() || !ValidateDisconnectRoutine())
+    return false;
+  HubTarget target = {0, 0};
+  DWORD matches = 0;
+  for (DWORD controller = 0; controller < 4; ++controller) {
+    BYTE* hcd = ((BYTE**)kUsbHcdTable)[controller];
+    BYTE* pool = hcd ? *(BYTE**)(hcd + 0x40) : 0;
+    BYTE* root = (BYTE*)g_get_root_hub_device_node(controller);
+    if (!pool || !root || !InNodePool(pool, root)) continue;
+    unsigned guard = 0;
+    for (BYTE* hub = NodeAt(pool, root[0xE]); hub && guard < 64;
+         hub = NodeAt(pool, hub[0xF]), ++guard) {
+      if (!InNodePool(pool, hub) || *(DWORD*)(hub + 4) != kHubClassDriver) continue;
+      unsigned inner = 0;
+      for (BYTE* child = NodeAt(pool, hub[0xE]); child && inner < 16;
+           child = NodeAt(pool, child[0xF]), ++inner) {
+        if (!InNodePool(pool, child)) break;
+        if (*(DWORD*)child || *(DWORD*)(child + 4) || (child[8] & 0xC0) ||
+            (child[0xB] & 7) != 2)
+          continue;
+        DWORD port = (child[8] >> 2) & 7;
+        if ((DeviceHandle*)child != g_get_port_device_node((DeviceHandle*)hub, port))
+          continue;
+        ++matches;
+        target.hub = (DeviceHandle*)hub;
+        target.port = port;
+      }
+    }
+  }
+  if (matches != 1) return false;
+  return UsbTransportRunDetached(HubReconnectInDomain, &target) >= 0;
+#else
+  return false;
+#endif
+}
+
 static bool ProfileForHandle(DeviceHandle* handle, AudioProfile* profile,
                              BYTE* rejection) {
   if (rejection) *rejection = 0;
@@ -771,6 +842,11 @@ static DWORD WINAPI AudioWorker(void*) {
   for (DWORD settle = 0; settle < 500 && !g_playback_handle; ++settle)
     Sleep(10);
   if (!g_playback_handle) ReenumerateBootDevice();
+  // Then an adapter behind an external hub (one try, after root ports).
+  if (!g_playback_handle && !g_bluetooth_handle) {
+    for (DWORD settle = 0; settle < 100 && !g_bluetooth_handle; ++settle) Sleep(10);
+    if (!g_bluetooth_handle) ReenumerateHubDevice();
+  }
 
   for (;;) {
     g_audio_api.playback_handle = (void*)g_playback_handle;

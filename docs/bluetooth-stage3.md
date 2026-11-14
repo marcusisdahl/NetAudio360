@@ -71,3 +71,17 @@ headphones' EVENT_VOLUME_CHANGED (re-registering after every CHANGED). The
 headphones then render their own volume (touch swipes on the NC 700) and
 report it (`bt-avrcp absolute volume=N/127`); the console volume is left as
 is.
+
+## Boot on a hub
+
+An adapter behind an external hub at boot is enumerated and closed (no
+driver) before DashLaunch loads the plugin; the root-port recovery
+(`ReenumerateBootDevice`) cannot reach it, and the Usb0 stick may sit on the
+same hub. `ReenumerateHubDevice` (driver.cpp) finds the single driverless
+type-2 node whose parent uses the hub class driver (0x801721EC on 17559),
+checks it with GetPortDeviceNode (export 881), and in the USB domain replays
+the hub driver's connection-change pair for that port only:
+DeviceDisconnected 0x800D6798, then DeviceConnected 0x800D7D20. Both routines
+and the hub descriptor are signature-checked. Node +8: bits 0-1 controller,
+2-4 port (0-based), 0x40 configured, 0x80 removal in progress.
+Switch: USB_AUDIO360_BT_HUB_BOOT_RECOVERY.

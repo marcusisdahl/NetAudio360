@@ -33,6 +33,8 @@ LONG UsbTransportIsoch(void* handle, void* transfer, WORD* lengths);
 // Passive caller: run a bounded, nonblocking operation in the USB domain.
 typedef void (*UsbDomainRoutine)(void*);
 LONG UsbTransportRun(UsbDomainRoutine routine, void* context);
+// Same, while no device is attached (boot-time re-enumeration only).
+LONG UsbTransportRunDetached(UsbDomainRoutine routine, void* context);
 // USB-domain only: no blocking dispatch. Same ownership and stop checks.
 LONG UsbTransportIsochInDomain(void* handle, void* transfer, WORD* lengths);
 // Called by completion callbacks before publishing their copied results.
