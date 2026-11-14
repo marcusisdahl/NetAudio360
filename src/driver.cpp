@@ -15,6 +15,10 @@
 #include "xbox_usb_transport.h"
 #include "detour.h"
 
+// Accept the Bluetooth adapter behind a USB 2.0 hub (EHCI controller).
+#ifndef USB_AUDIO360_BT_ALLOW_EHCI
+#define USB_AUDIO360_BT_ALLOW_EHCI 1
+#endif
 // Stage-1 Bluetooth adapter support (HCI scan). 0 restores the upstream
 // audio-only claim policy exactly.
 #ifndef USB_AUDIO360_BLUETOOTH
@@ -565,7 +569,14 @@ static bool BluetoothInterfaceForHandle(DeviceHandle* handle,
   DWORD controller = *((BYTE*)handle + 8) & 3;
   BYTE* hcd = ((BYTE**)kUsbHcdTable)[controller];
   if (!hcd) { *rejection = 7; return false; }
-  if (!(hcd[0x96] & 2)) { *rejection = 8; return false; }
+  // Bluetooth uses only control/interrupt/bulk, which the kernel also routes
+  // through EHCI (a USB 2.0 hub's transaction translator). Experimental: the
+  // completion status/length semantics there are unverified; a mismatch stops
+  // the Bluetooth worker with an error rather than streaming.
+  if (!(hcd[0x96] & 2) && !USB_AUDIO360_BT_ALLOW_EHCI) {
+    *rejection = 8;
+    return false;
+  }
   *interface_number = d->interface_number;
   return true;
 }
