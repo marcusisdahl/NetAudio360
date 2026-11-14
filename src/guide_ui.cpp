@@ -8,6 +8,7 @@
 #include "audio.h"
 #include "bluetooth.h"
 #include "detour.h"
+#include "diagnostics.h"
 #include "guide_icons.h"
 #include "guide_layout.h"
 
@@ -205,6 +206,12 @@ struct VolumeScene {
   bool synchronizing;
   bool bluetooth;  // Row shows the Bluetooth adapter instead of a DAC.
   WCHAR row_text[96];  // Bluetooth row label as last set.
+  // Look of the native row above (btnMCX), so the Bluetooth row matches it.
+  WCHAR row_visual[64];
+  float row_point_size;
+  // The gap between the native rows, relative to the panel: the Bluetooth
+  // row fills all of it so its edge lines up with the row below.
+  float gap_offset, gap_height;
 };
 
 struct SettingsScene {
@@ -273,11 +280,16 @@ bool DacConnected() {
 // devices live; the USB Audio buttons and label are hidden.
 void SetRowMode(VolumeScene* state, bool bluetooth) {
   if (state->expanded) SetExpanded(state, false, XUSER_INDEX_FOCUS, false);
-  D3DXVECTOR3 position(bluetooth ? 0.0f : 161.0f, 0, 0);
+  // Copy the native row's visual so the text is drawn in the same colour,
+  // and fill the whole gap so only one divider shows below the row.
+  const bool fill = bluetooth && state->gap_height >= 28.0f;
+  D3DXVECTOR3 position(bluetooth ? 0.0f : 161.0f, fill ? state->gap_offset : 0.0f, 0);
+  LPCWSTR visual = state->row_visual[0] ? state->row_visual : L"XuiButtonGuide";
   bool ok = g_xui.set_position(state->volume_button, &position) >= 0 &&
       SetFloat(state->volume_button, L"Width", bluetooth ? 323.0f : 52.0f) &&
+      SetFloat(state->volume_button, L"Height", fill ? state->gap_height : 28.0f) &&
       SetString(state->volume_button, L"Visual",
-                bluetooth ? L"XuiButtonGuide" : L"xuiButtonImageCenteredMusic") &&
+                bluetooth ? visual : L"xuiButtonImageCenteredMusic") &&
       SetString(state->volume_button, L"ImagePath", bluetooth ? L"" : g_volume_icon) &&
       SetString(state->volume_button, L"Text", bluetooth ? L"Bluetooth" : L"") &&
       SetBool(state->title, L"Show", !bluetooth) &&
@@ -286,7 +298,9 @@ void SetRowMode(VolumeScene* state, bool bluetooth) {
       SetString(state->volume_button, L"NavRight",
                 bluetooth ? L"" : L"MicrophoneMuteButton");
   if (ok) {
-    if (bluetooth) SetFloat(state->volume_button, L"PointSize", 12);
+    if (bluetooth)
+      SetFloat(state->volume_button, L"PointSize",
+               state->row_point_size > 0 ? state->row_point_size : 12);
     wcscpy_s(state->row_text, bluetooth ? L"Bluetooth" : L"");
     // The visual changed: let the skin rebuild it.
     XUIMessage message;
@@ -1655,6 +1669,27 @@ bool InjectMedia(HXUIOBJ scene) {
     return false;
   }
   state->host_scene = scene;
+  {
+    PropertyValue visual, point;
+    if (GetProperty(above, L"Visual", &visual) && visual.get()->type == XUI_EPT_STRING &&
+        visual.get()->szVal && wcslen(visual.get()->szVal) < _countof(state->row_visual))
+      wcscpy_s(state->row_visual, visual.get()->szVal);
+    if (GetProperty(above, L"PointSize", &point) && point.get()->type == XUI_EPT_FLOAT &&
+        point.get()->fVal >= 8 && point.get()->fVal <= 24)
+      state->row_point_size = point.get()->fVal;
+    const float gap_top = above_rect.y + above_rect.height;
+    const float gap = next_rect.y - gap_top;
+    if (gap >= 28 && gap <= 40) {
+      state->gap_offset = gap_top - insertion_y;
+      state->gap_height = gap;
+    }
+    char line[160];
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+                "guide row visual=%ls point=%d gap=%d offset=%d",
+                state->row_visual[0] ? state->row_visual : L"?",
+                (int)state->row_point_size, (int)gap, (int)state->gap_offset);
+    DiagnosticsText(line);
+  }
   state->above_button = above;
   state->next_button = next;
   wcscpy_s(state->old_down, old_down.get()->szVal ? old_down.get()->szVal : L"");
