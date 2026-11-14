@@ -51,7 +51,8 @@ enum Phase {
   kPhaseScanning = 3,
   kPhaseFinished = 4,
   kPhaseFailed = 5,   // Stopped; storage retained until removal drains.
-  kPhaseRearm = 6
+  kPhaseRearm = 6,
+  kPhaseSetConfig = 7
 };
 
 enum Error {
@@ -158,6 +159,13 @@ void Log(const char* format, ...) {
     if (DiagnosticsText(line)) return;
     Sleep(10);
   }
+}
+
+// Bring-up: name each first-time USB step in the log and give the
+// notification thread time to write it, so a hang points at its step.
+void Step(const char* name) {
+  Log("bt-step %s", name);
+  Sleep(300);
 }
 
 void Fail(Error error, LONG status) {
@@ -373,9 +381,11 @@ void StartAttachment() {
   InterlockedExchange(&g_event_fault, 0);
   for (int i = 1; i < 16; ++i) UsbBtDiagnostic[i] = 0;
   Log("bt-adapter attached");
+  Step("open-default");
   LONG status = UsbTransportOpenDefault(g_handle, &g_control.trb.endpoint);
   if (status < 0) { Fail(kErrOpenDefault, status); return; }
   SetPhase(kPhaseConfigHeader);
+  Step("get-configuration");
   QueueControl(0x80, 6, 0x0200, 0, 9);  // GET_DESCRIPTOR(configuration)
 }
 
@@ -391,8 +401,17 @@ void ConfigTick() {
     QueueControl(0x80, 6, 0x0200, 0, total);
     return;
   }
-  if (!bt::FindHciEndpoints(g_control_buffer, actual, &g_endpoints)) {
-    Fail(kErrDescriptor, actual);
+  if (g_phase == kPhaseConfig) {
+    if (!bt::FindHciEndpoints(g_control_buffer, actual, &g_endpoints)) {
+      Fail(kErrDescriptor, actual);
+      return;
+    }
+    // Like the audio path: select the configuration before using any
+    // non-default endpoint (bConfigurationValue at offset 5).
+    BYTE configuration = g_control_buffer[5];
+    SetPhase(kPhaseSetConfig);
+    Step("set-configuration");
+    QueueControl(0x00, 9, configuration, 0, 0);
     return;
   }
   const bt::HciEndpoints& e = g_endpoints;
@@ -402,13 +421,16 @@ void ConfigTick() {
       e.acl_in_max_packet, e.acl_out_address, e.acl_out_max_packet);
   g_event_length = e.event_max_packet;
   if (g_event_length > sizeof(g_event_buffer)) g_event_length = sizeof(g_event_buffer);
+  Step("open-interrupt");
   LONG status = UsbTransportOpen(g_handle, kUsbEndpointInterrupt,
                                  e.event_address, e.event_max_packet,
                                  e.event_interval ? e.event_interval : 1,
                                  &g_event_trb.trb.endpoint);
   UsbBtDiagnostic[kDiagOpenStatus] = (DWORD)status;
   if (status < 0) { Fail(kErrOpenEvents, status); return; }
+  Step("queue-interrupt");
   if (!QueueEvent()) return;
+  Step("hci-scan");
   SetPhase(kPhaseScanning);
   g_scanner.Start(GetTickCount());
 }
@@ -497,6 +519,7 @@ DWORD UiStatus() {
   switch (g_phase) {
     case kPhaseConfigHeader:
     case kPhaseConfig:
+    case kPhaseSetConfig:
       return kBluetoothStarting;
     case kPhaseScanning:
       return g_scanner.stage() >= bt::kStageInquiry ? kBluetoothScanning
@@ -556,6 +579,7 @@ void Tick() {
       break;
     case kPhaseConfigHeader:
     case kPhaseConfig:
+    case kPhaseSetConfig:
       ConfigTick();
       break;
     case kPhaseScanning:
@@ -612,6 +636,6 @@ DWORD WINAPI BluetoothWorker(void*) {
   for (;;) {
     Tick();
     Sleep(g_phase == kPhaseScanning || g_phase == kPhaseConfig ||
-          g_phase == kPhaseConfigHeader ? 1 : 20);
+          g_phase == kPhaseConfigHeader || g_phase == kPhaseSetConfig ? 1 : 20);
   }
 }
