@@ -20,6 +20,12 @@ extern "C" volatile DWORD UsbBtDiagnostic[16] = {0};
 #ifndef USB_AUDIO360_BT_CLAIM_ONLY
 #define USB_AUDIO360_BT_CLAIM_ONLY 0
 #endif
+// Delay between the claim and the first USB request. COD froze inside the
+// first default-endpoint open when it ran ~30 ms after the claim, while the
+// kernel had not yet offered the adapter's second interface.
+#ifndef USB_AUDIO360_BT_ATTACH_SETTLE_MS
+#define USB_AUDIO360_BT_ATTACH_SETTLE_MS 3000
+#endif
 
 namespace {
 
@@ -115,6 +121,8 @@ static bt::ByteRing<4096> g_events;
 static void* volatile g_attached_handle = 0;
 static volatile LONG g_removed = 0;
 static volatile DWORD g_removed_at = 0;
+static volatile DWORD g_attached_at = 0;
+static bool g_settle_logged = false;
 static volatile LONG g_control_done = 0;
 static volatile LONG g_control_status = 0;
 static volatile DWORD g_control_actual = 0;
@@ -393,6 +401,8 @@ void StartAttachment() {
 #endif
   Step("open-default");
   LONG status = UsbTransportOpenDefault(g_handle, &g_control.trb.endpoint);
+  Log("bt-open-default status=0x%08x endpoint=0x%08x", (unsigned)status,
+      (unsigned)g_control.trb.endpoint);
   if (status < 0) { Fail(kErrOpenDefault, status); return; }
   SetPhase(kPhaseConfigHeader);
   Step("get-configuration");
@@ -585,7 +595,15 @@ void Tick() {
   }
   switch (g_phase) {
     case kPhaseIdle:
-      if (g_attached_handle && !g_removed) StartAttachment();
+      if (!g_attached_handle || g_removed) { g_settle_logged = false; break; }
+      if (!g_settle_logged) {
+        g_settle_logged = true;
+        Log("bt-adapter claimed; waiting %u ms before the first USB request",
+            (unsigned)USB_AUDIO360_BT_ATTACH_SETTLE_MS);
+      }
+      if (GetTickCount() - g_attached_at < USB_AUDIO360_BT_ATTACH_SETTLE_MS) break;
+      g_settle_logged = false;
+      StartAttachment();
       break;
     case kPhaseConfigHeader:
     case kPhaseConfig:
@@ -610,6 +628,8 @@ void Tick() {
 }  // namespace
 
 VOID BluetoothDeviceAttached(void* handle) {
+  g_attached_at = GetTickCount();
+  MemoryBarrier();
   g_attached_handle = handle;
 }
 

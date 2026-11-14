@@ -137,6 +137,15 @@ reads a snapshot (`BluetoothGetUiState`) and never touches USB.
   and was rejected as `not-full-speed-ohci`. Next step: try another port with
   no hub in between, or put a USB 1.1 hub in front of it.
 
+- Front port (no hub): claimed on controller 2 (OHCI). COD froze 2–3 s
+  later; the last log line was `bt-step open-default`, about 30 ms after the
+  claim. A claim-only build (`USB_AUDIO360_BT_CLAIM_ONLY=1`, no USB requests)
+  kept COD responsive, so the hang is in or after the first default-endpoint
+  open. The kernel's add event for the adapter's second interface never
+  appeared before the open. `USB_AUDIO360_BT_ATTACH_SETTLE_MS` (default
+  3000) now delays the first request, and `bt-open-default status=` logs the
+  result.
+
 ## Next
 
 Stage 2 adds Secure Simple Pairing, link keys in the ini, and connect/forget.
