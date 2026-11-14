@@ -403,7 +403,10 @@ static bt::Link g_link(&g_link_log);
 // slots follow the same rules as the event pump: callbacks copy and publish,
 // the worker submits.
 
-const unsigned kAclOutSlots = 3;
+// Four OUT slots: one media packet is three ACL fragments at the CSR's 310-byte
+// MTU, and the worker can wake late. Control, event, ACL in and these four
+// stay within the transport's eight tracked transfers.
+const unsigned kAclOutSlots = 4;
 const unsigned kAclOutBytes = 1104;  // HCI ACL header + one L2CAP fragment.
 const DWORD kToneMs = 2000;          // 375 Hz test tone before the system mix.
 const DWORD kStreamLeadMs = 60;      // Send this far ahead of real time.
@@ -442,7 +445,7 @@ static DWORD g_acl_in_length = 64;
 static UsbControlTrb g_acl_out_trb[kAclOutSlots];
 static __declspec(align(128)) BYTE g_acl_out_buffer[kAclOutSlots][kAclOutBytes];
 static volatile LONG g_acl_in_pending = 0;
-static volatile LONG g_acl_out_pending[kAclOutSlots] = {0, 0, 0};
+static volatile LONG g_acl_out_pending[kAclOutSlots] = {0, 0, 0, 0};
 static volatile LONG g_acl_fault = 0;
 static volatile LONG g_acl_fault_status = 0;
 static bt::ByteRing<8192> g_acl_bytes;
@@ -870,6 +873,21 @@ void AclTick(DWORD now) {
   UsbBtA2dp[kA2Credits] = g_acl_credits;
   UsbBtA2dp[kA2AclMtu] = g_scanner.acl_mtu();
   UsbBtA2dp[kA2AclBuffers] = g_scanner.acl_buffers();
+}
+
+// While streaming, keep feeding queued fragments for up to 3 ms instead of
+// waiting for the next wake: under a busy dashboard a Sleep(1) can last tens
+// of milliseconds, and each wake would otherwise move only a few fragments.
+void PumpBacklog() {
+  if (!g_acl_ready || !g_a2dp.streaming()) return;
+  DWORD begin = GetTickCount();
+  while (GetTickCount() - begin < 3) {
+    if (g_acl_fault) return;
+    bool backlog = g_tx_offset < g_tx_length || g_a2dp.HasOutput();
+    if (!backlog || !g_acl_credits) return;
+    AclTransmit();
+    Sleep(0);
+  }
 }
 
 bool AudioActive() {
@@ -1410,6 +1428,7 @@ void Tick() {
       break;
     case kPhaseFinished:
       FinishedTick();
+      if (g_phase == kPhaseFinished) PumpBacklog();
       break;
     case kPhaseRearm:
       RearmTick();
