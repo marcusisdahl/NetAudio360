@@ -14,6 +14,7 @@
 
 #include "audio.h"
 #include "bt_a2dp.h"
+#include "bt_avrcp.h"
 #include "bt_hci.h"
 #include "bt_link.h"
 #include "bt_sbc.h"
@@ -504,6 +505,14 @@ class A2dpLog : public bt::A2dpObserver {
     g_audio_ui = kBluetoothAudioFailed;
     g_audio_failure = failure;
     g_audio_detail = detail;
+  }
+  void OnAvrcpKey(unsigned operation) {
+    // Headphone volume keys drive the console volume (the stream's gain).
+    LONG volume = AudioGetVolume();
+    if (operation == bt::kAvrcpVolumeUp) AudioSetVolume(volume + 5);
+    else if (operation == bt::kAvrcpVolumeDown) AudioSetVolume(volume - 5);
+    else if (operation == bt::kAvrcpMute) AudioSetOutputMuted(!AudioIsOutputMuted());
+    Log("bt-avrcp key=0x%02x volume=%d", operation, (int)AudioGetVolume());
   }
   void OnA2dpConfigured(const bt::SbcConfig& c) {
     g_sbc_ready = g_sbc.Configure(c);

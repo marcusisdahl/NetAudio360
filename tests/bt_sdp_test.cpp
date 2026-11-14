@@ -82,11 +82,23 @@ int main() {
          out[9] == 0 && out[10] == 0);
 
   // ServiceSearch, then ServiceAttribute on the returned handle.
-  const u8 search[] = {0x02, 0x00, 0x01, 0x00, 0x08, 0x35, 0x03, 0x19, 0x01, 0x00,
+  const u8 search[] = {0x02, 0x00, 0x01, 0x00, 0x08, 0x35, 0x03, 0x19, 0x11, 0x0A,
                        0x00, 0x05, 0x00};
   n = SdpHandle(search, sizeof(search), out, sizeof(out));
   assert(n == 14 && out[0] == 0x03 && out[6] == 1 && out[8] == 1);
   assert(out[9] == 0 && out[10] == 1 && out[11] == 0 && out[12] == 1 && out[13] == 0);
+  // L2CAP is in both records.
+  const u8 search_l2cap[] = {0x02, 0x00, 0x01, 0x00, 0x08, 0x35, 0x03, 0x19, 0x01,
+                             0x00, 0x00, 0x05, 0x00};
+  n = SdpHandle(search_l2cap, sizeof(search_l2cap), out, sizeof(out));
+  assert(n == 18 && out[6] == 2 && out[16] == 2);
+  // AVRCP: the remote control service class finds the target record.
+  const u8 avrcp[] = {0x19, 0x11, 0x0E};
+  n = SearchAttribute(avrcp, sizeof(avrcp), 0xFFFF, zero, 1, out, sizeof(out));
+  const u8 avctp[] = {0x19, 0x01, 0x00, 0x09, 0x00, 0x17};
+  const u8 target[] = {0x19, 0x11, 0x0C};
+  assert(n > 20 && Contains(out, n, avctp, sizeof(avctp)) &&
+         Contains(out, n, target, sizeof(target)) && !Contains(out, n, psm, sizeof(psm)));
   const u8 attr[] = {0x04, 0x00, 0x02, 0x00, 0x0C, 0x00, 0x01, 0x00, 0x01, 0x00, 0x40,
                      0x35, 0x03, 0x09, 0x00, 0x04, 0x00};
   n = SdpHandle(attr, sizeof(attr), out, sizeof(out));

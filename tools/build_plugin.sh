@@ -140,7 +140,7 @@ cp "$project_root/src/bt_hci.cpp" "$build_dir/bt_hci.cpp"
 cp "$project_root/src/bt_hci.h" "$build_dir/bt_hci.h"
 cp "$project_root/src/bt_link.cpp" "$build_dir/bt_link.cpp"
 cp "$project_root/src/bt_link.h" "$build_dir/bt_link.h"
-for f in bt_sbc bt_a2dp bt_sdp; do
+for f in bt_sbc bt_a2dp bt_sdp bt_avrcp; do
   cp "$project_root/src/$f.cpp" "$build_dir/$f.cpp"
   cp "$project_root/src/$f.h" "$build_dir/$f.h"
 done
@@ -181,6 +181,7 @@ compile bt_link.cpp bt_link.obj
 compile bt_sbc.cpp bt_sbc.obj
 compile bt_a2dp.cpp bt_a2dp.obj
 compile bt_sdp.cpp bt_sdp.obj
+compile bt_avrcp.cpp bt_avrcp.obj
 
 link_command="set TMP=$wine_build\\tmp&& set TEMP=$wine_build\\tmp&& "
 link_command+="$wine_xdk\\bin\\win32\\link.exe /nologo /dll /release /xex:no "
@@ -194,7 +195,7 @@ link_command+="$wine_build\\remote_volume.obj "
 link_command+="$wine_build\\diagnostics.obj "
 link_command+="$wine_build\\xbox_usb_transport.obj "
 link_command+="$wine_build\\uac_descriptors.obj $wine_build\\uac_clock.obj "
-link_command+="$wine_build\\bluetooth.obj $wine_build\\bt_hci.obj $wine_build\\bt_link.obj $wine_build\\bt_sbc.obj $wine_build\\bt_a2dp.obj $wine_build\\bt_sdp.obj "
+link_command+="$wine_build\\bluetooth.obj $wine_build\\bt_hci.obj $wine_build\\bt_link.obj $wine_build\\bt_sbc.obj $wine_build\\bt_a2dp.obj $wine_build\\bt_sdp.obj $wine_build\\bt_avrcp.obj "
 link_command+="$wine_build\\detour.obj xapilib.lib xboxkrnl.lib libcMT.lib"
 "${wine_env[@]}" wine cmd /c "$link_command"
 

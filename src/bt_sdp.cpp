@@ -48,7 +48,7 @@ const u8 kName[] = {0x25, 0x0C, 'A', 'u', 'd', 'i', 'o', ' ',
                     'S', 'o', 'u', 'r', 'c', 'e'};
 const u8 kFeatures[] = {0x09, 0x00, 0x01};                       // Player
 
-const Attribute kRecord[] = {
+const Attribute kA2dpRecord[] = {
   {0x0000, kHandle, sizeof(kHandle)},
   {0x0001, kClasses, sizeof(kClasses)},
   {0x0004, kProtocols, sizeof(kProtocols)},
@@ -58,10 +58,52 @@ const Attribute kRecord[] = {
   {0x0100, kName, sizeof(kName)},
   {0x0311, kFeatures, sizeof(kFeatures)},
 };
-const unsigned kRecordCount = sizeof(kRecord) / sizeof(kRecord[0]);
-
 // UUIDs the record contains (as 32-bit short forms of the base UUID).
-const u32 kRecordUuids[] = {0x110A, 0x0100, 0x0019, 0x1002, 0x110D};
+const u32 kA2dpUuids[] = {0x110A, 0x0100, 0x0019, 0x1002, 0x110D};
+
+// AVRCP Target record (AVRCP 1.6 section 8): category 1 (player), so the
+// headphones connect AVCTP and send their keys to us.
+const u8 kAvrcpHandle[] = {0x0A, 0x00, 0x01, 0x00, 0x02};
+const u8 kAvrcpClasses[] = {0x35, 0x03, 0x19, 0x11, 0x0C};    // A/V RC Target
+const u8 kAvrcpProtocols[] = {0x35, 0x10,
+                              0x35, 0x06, 0x19, 0x01, 0x00,     // L2CAP
+                              0x09, 0x00, 0x17,                 //  PSM AVCTP
+                              0x35, 0x06, 0x19, 0x00, 0x17,     // AVCTP
+                              0x09, 0x01, 0x03};                //  1.3
+const u8 kAvrcpProfiles[] = {0x35, 0x08, 0x35, 0x06, 0x19, 0x11, 0x0E,  // AVRCP
+                             0x09, 0x01, 0x04};                           // 1.4
+const u8 kAvrcpName[] = {0x25, 0x0E, 'R', 'e', 'm', 'o', 't', 'e', ' ',
+                         'C', 'o', 'n', 't', 'r', 'o', 'l'};
+const u8 kAvrcpFeatures[] = {0x09, 0x00, 0x01};                  // Category 1
+
+const Attribute kAvrcpRecord[] = {
+  {0x0000, kAvrcpHandle, sizeof(kAvrcpHandle)},
+  {0x0001, kAvrcpClasses, sizeof(kAvrcpClasses)},
+  {0x0004, kAvrcpProtocols, sizeof(kAvrcpProtocols)},
+  {0x0005, kBrowse, sizeof(kBrowse)},
+  {0x0006, kLanguages, sizeof(kLanguages)},
+  {0x0009, kAvrcpProfiles, sizeof(kAvrcpProfiles)},
+  {0x0100, kAvrcpName, sizeof(kAvrcpName)},
+  {0x0311, kAvrcpFeatures, sizeof(kAvrcpFeatures)},
+};
+const u32 kAvrcpUuids[] = {0x110C, 0x0100, 0x0017, 0x1002, 0x110E};
+
+struct Record {
+  u32 handle;
+  const Attribute* attributes;
+  unsigned count;
+  const u32* uuids;
+  unsigned uuid_count;
+};
+#define BT_COUNT(a) (sizeof(a) / sizeof((a)[0]))
+const Record kRecords[] = {
+  {kSdpA2dpSourceHandle, kA2dpRecord, BT_COUNT(kA2dpRecord), kA2dpUuids,
+   BT_COUNT(kA2dpUuids)},
+  {kSdpAvrcpTargetHandle, kAvrcpRecord, BT_COUNT(kAvrcpRecord), kAvrcpUuids,
+   BT_COUNT(kAvrcpUuids)},
+};
+const unsigned kRecordTotal = BT_COUNT(kRecords);
+const unsigned kMaxAttributes = 8;
 
 // Reads a data element header. Returns the header size, or 0 if malformed.
 unsigned Element(const u8* p, unsigned n, u8* type, unsigned* length) {
@@ -95,8 +137,8 @@ unsigned Sequence(const u8* p, unsigned n, const u8** body, unsigned* body_lengt
 const u8 kBaseUuid[12] = {0x00, 0x00, 0x10, 0x00, 0x80, 0x00,
                           0x00, 0x80, 0x5F, 0x9B, 0x34, 0xFB};
 
-// True when every UUID in the search pattern is in our record.
-bool PatternMatches(const u8* p, unsigned n, bool* ok) {
+// True when every UUID in the search pattern is in the record.
+bool PatternMatches(const Record& record, const u8* p, unsigned n, bool* ok) {
   *ok = false;
   unsigned count = 0;
   bool all = true;
@@ -114,8 +156,8 @@ bool PatternMatches(const u8* p, unsigned n, bool* ok) {
     else if (length == 16) known = false;
     else return false;
     bool found = false;
-    for (unsigned i = 0; known && i < sizeof(kRecordUuids) / sizeof(kRecordUuids[0]); ++i)
-      if (kRecordUuids[i] == uuid) found = true;
+    for (unsigned i = 0; known && i < record.uuid_count; ++i)
+      if (record.uuids[i] == uuid) found = true;
     if (!found) all = false;
     ++count;
     p += header + length;
@@ -128,9 +170,12 @@ bool PatternMatches(const u8* p, unsigned n, bool* ok) {
 
 // Writes the attributes selected by an attribute ID list as one data
 // element sequence. Returns its length, 0 if the list is malformed.
-unsigned WriteAttributes(const u8* ids, unsigned n, u8* out, unsigned capacity) {
-  bool selected[kRecordCount];
-  for (unsigned i = 0; i < kRecordCount; ++i) selected[i] = false;
+unsigned WriteAttributes(const Record& record, const u8* ids, unsigned n,
+                         u8* out, unsigned capacity) {
+  const Attribute* attributes = record.attributes;
+  const unsigned count = record.count;
+  bool selected[kMaxAttributes];
+  for (unsigned i = 0; i < kMaxAttributes; ++i) selected[i] = false;
   bool any = false;
   while (n) {
     u8 type = 0;
@@ -141,26 +186,26 @@ unsigned WriteAttributes(const u8* ids, unsigned n, u8* out, unsigned capacity) 
     if (length == 2) { low = high = Be16(ids + header); }
     else if (length == 4) { low = Be16(ids + header); high = Be16(ids + header + 2); }
     else return 0;
-    for (unsigned i = 0; i < kRecordCount; ++i)
-      if (kRecord[i].id >= low && kRecord[i].id <= high) selected[i] = true;
+    for (unsigned i = 0; i < count; ++i)
+      if (attributes[i].id >= low && attributes[i].id <= high) selected[i] = true;
     any = true;
     ids += header + length;
     n -= header + length;
   }
   if (!any) return 0;
   unsigned body = 0;
-  for (unsigned i = 0; i < kRecordCount; ++i)
-    if (selected[i]) body += 3 + kRecord[i].length;
+  for (unsigned i = 0; i < count; ++i)
+    if (selected[i]) body += 3 + attributes[i].length;
   if (3 + body > capacity) return 0;
   out[0] = 0x36;  // Sequence, 16-bit length (always fits our record).
   PutBe16(out + 1, body);
   unsigned at = 3;
-  for (unsigned i = 0; i < kRecordCount; ++i) {
+  for (unsigned i = 0; i < count; ++i) {
     if (!selected[i]) continue;
     out[at] = 0x09;
-    PutBe16(out + at + 1, kRecord[i].id);
-    memcpy(out + at + 3, kRecord[i].value, kRecord[i].length);
-    at += 3 + kRecord[i].length;
+    PutBe16(out + at + 1, attributes[i].id);
+    memcpy(out + at + 3, attributes[i].value, attributes[i].length);
+    at += 3 + attributes[i].length;
   }
   return at;
 }
@@ -222,27 +267,32 @@ unsigned SdpHandle(const u8* request, unsigned length, u8* out,
     return Error(transaction, kErrBadPduSize, out, capacity);
   const u8* p = request + 5;
   unsigned n = parameters;
-  u8 full[256];
+  u8 full[512];
 
   if (pdu == kSearchRequest) {
     const u8* pattern; unsigned pattern_length;
     unsigned used = Sequence(p, n, &pattern, &pattern_length);
     if (!used || used + 2 > n) return Error(transaction, kErrBadSyntax, out, capacity);
     bool valid = false;
-    bool match = PatternMatches(pattern, pattern_length, &valid);
+    u32 handles[kRecordTotal];
+    unsigned count = 0;
+    for (unsigned r = 0; r < kRecordTotal; ++r)
+      if (PatternMatches(kRecords[r], pattern, pattern_length, &valid))
+        handles[count++] = kRecords[r].handle;
     unsigned max_records = Be16(p + used);
     unsigned offset = 0;
     if (!valid || !ReadContinuation(p + used + 2, n - used - 2, &offset))
       return Error(transaction, kErrBadSyntax, out, capacity);
-    unsigned count = match && max_records ? 1 : 0;
+    if (count > max_records) count = max_records;
     if (capacity < 5 + 4 + 4 * count + 1) return 0;
     out[0] = kSearchResponse;
     PutBe16(out + 1, transaction);
     PutBe16(out + 5, count);
     PutBe16(out + 7, count);
     unsigned at = 9;
-    if (count) {
-      out[at] = 0x00; out[at + 1] = 0x01; out[at + 2] = 0x00; out[at + 3] = 0x01;
+    for (unsigned i = 0; i < count; ++i) {
+      out[at] = (u8)(handles[i] >> 24); out[at + 1] = (u8)(handles[i] >> 16);
+      out[at + 2] = (u8)(handles[i] >> 8); out[at + 3] = (u8)handles[i];
       at += 4;
     }
     out[at++] = 0;
@@ -260,9 +310,11 @@ unsigned SdpHandle(const u8* request, unsigned length, u8* out,
     if (!used || max_bytes < 7 ||
         !ReadContinuation(p + 6 + used, n - 6 - used, &offset))
       return Error(transaction, kErrBadSyntax, out, capacity);
-    if (handle != kSdpA2dpSourceHandle)
-      return Error(transaction, kErrBadHandle, out, capacity);
-    unsigned full_length = WriteAttributes(ids, ids_length, full, sizeof(full));
+    const Record* record = 0;
+    for (unsigned r = 0; r < kRecordTotal; ++r)
+      if (kRecords[r].handle == handle) record = &kRecords[r];
+    if (!record) return Error(transaction, kErrBadHandle, out, capacity);
+    unsigned full_length = WriteAttributes(*record, ids, ids_length, full, sizeof(full));
     if (!full_length) return Error(transaction, kErrBadSyntax, out, capacity);
     return Chunked(kAttributeResponse, transaction, full, full_length, offset,
                    max_bytes, out, capacity);
@@ -272,19 +324,22 @@ unsigned SdpHandle(const u8* request, unsigned length, u8* out,
     const u8* pattern; unsigned pattern_length;
     unsigned used = Sequence(p, n, &pattern, &pattern_length);
     if (!used || used + 2 > n) return Error(transaction, kErrBadSyntax, out, capacity);
-    bool valid = false;
-    bool match = PatternMatches(pattern, pattern_length, &valid);
     unsigned max_bytes = Be16(p + used);
     const u8* ids; unsigned ids_length;
     unsigned used2 = Sequence(p + used + 2, n - used - 2, &ids, &ids_length);
     unsigned offset = 0;
-    if (!valid || !used2 || max_bytes < 7 ||
+    if (!used2 || max_bytes < 7 ||
         !ReadContinuation(p + used + 2 + used2, n - used - 2 - used2, &offset))
       return Error(transaction, kErrBadSyntax, out, capacity);
-    // A sequence of attribute lists: ours if the pattern matched, else empty.
+    // A sequence of attribute lists, one per matching record.
     unsigned full_length = 3;
-    if (match) {
-      unsigned list = WriteAttributes(ids, ids_length, full + 3, sizeof(full) - 3);
+    for (unsigned r = 0; r < kRecordTotal; ++r) {
+      bool valid = false;
+      bool match = PatternMatches(kRecords[r], pattern, pattern_length, &valid);
+      if (!valid) return Error(transaction, kErrBadSyntax, out, capacity);
+      if (!match) continue;
+      unsigned list = WriteAttributes(kRecords[r], ids, ids_length,
+                                      full + full_length, sizeof(full) - full_length);
       if (!list) return Error(transaction, kErrBadSyntax, out, capacity);
       full_length += list;
     }

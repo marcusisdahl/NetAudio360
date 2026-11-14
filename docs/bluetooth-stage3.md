@@ -53,3 +53,15 @@ answers with `bt::SdpHandle` (src/bt_sdp.cpp): one A2DP Source record
 (handle 0x00010001; AudioSource 0x110A, L2CAP PSM 0x19 + AVDTP 1.3, A2DP 1.3,
 features Player), supporting ServiceSearch, ServiceAttribute and
 ServiceSearchAttribute with continuation.
+
+## AVRCP (headphone volume keys)
+
+SDP also offers an AVRCP Target record (handle 0x00010002, category 1,
+AVCTP PSM 0x17, AVRCP 1.4). `A2dpSource` accepts the headphones' AVCTP
+channel on local CID 0x0043, or opens it itself 1.5 s after streaming starts
+if they have not. `bt::AvrcpHandle` (src/bt_avrcp.cpp) answers UNIT/SUBUNIT
+INFO, PASS THROUGH (accepted), GetCapabilities, GetPlayStatus and
+RegisterNotification (playback status / track changed, interim only), and
+rejects the rest. PASS THROUGH volume up/down/mute presses change the plugin
+volume (`bt-avrcp key=...` in the log). Absolute volume is not implemented,
+so headphones that only support absolute volume will not send keys yet.

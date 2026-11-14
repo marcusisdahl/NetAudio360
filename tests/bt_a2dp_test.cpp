@@ -16,16 +16,20 @@ u16 Le16(const u8* p) { return (u16)(p[0] | (p[1] << 8)); }
 
 struct Recorder : A2dpObserver {
   Recorder() : states(0), last_state(0), failed(0), failure(0), detail(0),
-               configured(0) { memset(&config, 0, sizeof(config)); }
+               configured(0), keys(0), last_key(0) {
+    memset(&config, 0, sizeof(config));
+  }
   void OnA2dpState(unsigned s) { ++states; last_state = s; }
   void OnA2dpFailed(unsigned f, unsigned d) { ++failed; failure = f; detail = d; }
   void OnA2dpConfigured(const SbcConfig& c) { ++configured; config = c; }
+  void OnAvrcpKey(unsigned op) { ++keys; last_key = op; }
   int states;
   unsigned last_state;
   int failed;
   unsigned failure, detail;
   int configured;
   SbcConfig config;
+  unsigned keys, last_key;
 };
 
 // Pops one output frame; checks the CID and returns the payload.
@@ -204,11 +208,17 @@ void TestStreamSetup() {
   u8 id;
   d = ExpectSignal(a, 0x0B, &id, &n);
   assert(id == 7 && n == 8 && Le16(d) == 2 && Le16(d + 2) == 0);
-  // AVRCP connection attempts are refused.
+  // The headphones open AVRCP: accepted, and their volume keys reach us.
   u8 avrcp[4] = {0x17, 0x00, 0x60, 0x00};
   Signal(a, 0x02, 8, avrcp, 4, now);
   d = ExpectSignal(a, 0x03, &id, &n);
-  assert(Le16(d) == 0 && Le16(d + 2) == 0x60 && Le16(d + 4) == 2);
+  assert(Le16(d) == 0x43 && Le16(d + 2) == 0x60 && Le16(d + 4) == 0);
+  d = ExpectSignal(a, 0x04, &id, &n);
+  assert(Le16(d) == 0x60);
+  u8 key[8] = {0x30, 0x11, 0x0E, 0x00, 0x48, 0x7C, 0x42, 0x00};
+  Frame(a, 0x0043, key, 8, now);
+  m = Pop(a, 0x0060, &n);
+  assert(n == 8 && m[0] == 0x32 && m[3] == 0x09 && r.keys == 1 && r.last_key == 0x42);
 
   // Remote closes the media channel.
   u8 disc[4] = {0x41, 0x00, 0x51, 0x00};

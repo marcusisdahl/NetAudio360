@@ -3,6 +3,7 @@
 
 #include <string.h>
 
+#include "bt_avrcp.h"
 #include "bt_sdp.h"
 
 namespace bt {
@@ -27,6 +28,7 @@ enum {
 const u16 kSignalingCid = 0x0001;
 const u16 kPsmAvdtp = 0x0019;
 const u16 kPsmSdp = 0x0001;
+const u16 kPsmAvctp = 0x0017;
 
 // AVDTP signals and message types (AVDTP 8.4-8.5).
 enum {
@@ -127,6 +129,9 @@ void A2dpSource::Reset() {
   memset(&signal_, 0, sizeof(signal_));
   memset(&media_, 0, sizeof(media_));
   memset(&sdp_, 0, sizeof(sdp_));
+  memset(&avctp_, 0, sizeof(avctp_));
+  avctp_tried_ = false;
+  streaming_since_ = 0;
   remote_signal_mtu_ = 672;
   remote_media_mtu_ = 672;
   remote_sdp_mtu_ = 672;
@@ -212,6 +217,8 @@ void A2dpSource::Command(u8 signal, const u8* data, unsigned n, unsigned now) {
 }
 
 void A2dpSource::SetState(unsigned state, unsigned now) {
+  if (state == kA2dpStreaming && state_ != kA2dpStreaming && !streaming_since_)
+    streaming_since_ = now ? now : 1;
   state_ = state;
   deadline_ = now + kStepTimeoutMs;
   deadline_armed_ = state != kA2dpStreaming && state != kA2dpSuspended &&
@@ -274,6 +281,8 @@ void A2dpSource::OnFrame(const u8* frame, unsigned length, unsigned now) {
     OnAvdtp(p, n, now);
   } else if (cid == kSdpCid && sdp_.connected) {
     OnSdp(p, n);
+  } else if (cid == kAvctpCid && avctp_.connected) {
+    OnAvctp(p, n);
   } else {
     // Media channel input (none expected for a source) or unknown CID.
     if (cid != kMediaCid) ++unhandled_;
@@ -294,6 +303,8 @@ void A2dpSource::OnSignal(const u8* p, unsigned n, unsigned now) {
       if (psm == kPsmAvdtp && !signal_.connected && !signal_.open_requested) {
         c = &signal_; local = kSignalCid;   // Headphones opened signalling.
         if (state_ == kA2dpIdle) SetState(kA2dpSignalConnect, now);
+      } else if (psm == kPsmAvctp && !avctp_.connected && !avctp_.open_requested) {
+        c = &avctp_; local = kAvctpCid;  // Headphones' remote control.
       } else if (psm == kPsmSdp && !sdp_.connected) {
         c = &sdp_; local = kSdpCid;  // Headphones look up our A2DP record.
         remote_sdp_mtu_ = 672;
@@ -319,6 +330,10 @@ void A2dpSource::OnSignal(const u8* p, unsigned n, unsigned now) {
       Channel* c = ChannelFor(scid);
       if (!c || !c->open_requested || c->connected) { ++unhandled_; break; }
       if (result == 0x0001) break;  // Pending: wait for the final response.
+      if (result != 0 && c == &avctp_) {  // Optional: audio keeps playing.
+        memset(&avctp_, 0, sizeof(avctp_));
+        break;
+      }
       if (result != 0) { Fail(kA2dpFailL2cap, result); break; }
       c->remote_cid = dcid;
       c->connected = true;
@@ -365,6 +380,7 @@ void A2dpSource::OnSignal(const u8* p, unsigned n, unsigned now) {
       Channel* c = ChannelFor(scid);
       if (!c) { ++unhandled_; break; }
       if (result == 0x0004) break;  // Pending.
+      if (result != 0 && c == &avctp_) break;  // Leave remote control unused.
       if (result != 0) { Fail(kA2dpFailL2cap, 0x100 | result); break; }
       c->our_config_done = true;
       ChannelReady(now);
@@ -379,6 +395,10 @@ void A2dpSource::OnSignal(const u8* p, unsigned n, unsigned now) {
       SendSignal(kDisconnectionResponse, id, r, sizeof(r));
       if (dcid == kSdpCid) {  // Query done; not part of the stream.
         memset(&sdp_, 0, sizeof(sdp_));
+        break;
+      }
+      if (dcid == kAvctpCid) {  // Remote control closed; audio continues.
+        memset(&avctp_, 0, sizeof(avctp_));
         break;
       }
       if (dcid == kSignalCid || dcid == kMediaCid) {
@@ -429,6 +449,7 @@ A2dpSource::Channel* A2dpSource::ChannelFor(u16 local_cid) {
   if (local_cid == kSignalCid) return &signal_;
   if (local_cid == kMediaCid) return &media_;
   if (local_cid == kSdpCid) return &sdp_;
+  if (local_cid == kAvctpCid) return &avctp_;
   return 0;
 }
 
@@ -442,6 +463,19 @@ void A2dpSource::OnSdp(const u8* p, unsigned n) {
   if (!length) return;  // Nothing committed; the slot stays free.
   Put16(out - 4, length);
   Commit(length);
+}
+
+void A2dpSource::OnAvctp(const u8* p, unsigned n) {
+  unsigned capacity = 64;
+  u8* out = Begin(avctp_.remote_cid, capacity);
+  if (!out) return;  // Queue full: drop the reply; the headset retries.
+  u8 pressed = 0;
+  unsigned length = AvrcpHandle(p, n, out, capacity, &pressed);
+  if (length) {
+    Put16(out - 4, length);
+    Commit(length);
+  }
+  if (pressed && observer_) observer_->OnAvrcpKey(pressed);
 }
 
 void A2dpSource::WriteOurCapabilities(u8* out, unsigned* n) const {
@@ -667,6 +701,19 @@ bool A2dpSource::SendMedia(const u8* frames, unsigned bytes,
 void A2dpSource::Tick(unsigned now) {
   if (deadline_armed_ && Expired(now, deadline_))
     Fail(kA2dpFailTimeout, state_);
+  // Many headphones connect AVRCP themselves; if they have not shortly after
+  // the stream starts, open it so their volume keys reach us.
+  if (state_ == kA2dpStreaming && !avctp_tried_ && !avctp_.connected &&
+      !avctp_.open_requested && Expired(now, streaming_since_ + kAvctpDelayMs) &&
+      free_slots() >= 2) {
+    avctp_tried_ = true;
+    avctp_.open_requested = true;
+    u8 d[4];
+    Put16(d, kPsmAvctp);
+    Put16(d + 2, kAvctpCid);
+    SendSignal(kConnectionRequest, next_id_++, d, sizeof(d));
+    if (!next_id_) next_id_ = 1;
+  }
 }
 
 }  // namespace bt
