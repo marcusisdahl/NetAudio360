@@ -127,6 +127,15 @@ static bt::HciEndpoints g_endpoints;
 static DWORD g_event_length = 0;
 static bt::EventAssembler g_assembler;
 static BYTE g_drain[256];
+static WORD g_manufacturer = 0;
+static volatile LONG g_scan_request = 0;
+
+// Guide snapshot: written by the worker, copied out by the UI thread.
+static CRITICAL_SECTION g_ui_lock;
+static volatile LONG g_ui_ready = 0;
+static BluetoothUiState g_ui;
+static BluetoothUiState g_ui_next;
+static DWORD g_ui_published_at = 0;
 
 void SetPhase(Phase phase) {
   g_phase = phase;
@@ -178,6 +187,7 @@ void Printable(const char* in, char* out, size_t capacity) {
 class LogObserver : public bt::ScanObserver {
  public:
   void OnLocalVersion(const bt::LocalVersion& v) {
+    g_manufacturer = v.manufacturer;
     Log("bt-local hci=%u rev=0x%04x lmp=%u subver=0x%04x manufacturer=%u%s",
         v.hci_version, v.hci_revision, v.lmp_version, v.lmp_subversion,
         v.manufacturer, v.manufacturer == 10 ? " (CSR)" : "");
@@ -358,6 +368,8 @@ void StartAttachment() {
   g_events.Clear();
   g_assembler.Reset();
   g_control_pending = false;
+  g_manufacturer = 0;
+  InterlockedExchange(&g_scan_request, 0);
   InterlockedExchange(&g_event_fault, 0);
   for (int i = 1; i < 16; ++i) UsbBtDiagnostic[i] = 0;
   Log("bt-adapter attached");
@@ -441,8 +453,16 @@ void ScanTick() {
 
 void FinishedTick() {
   // Keep the event pipe serviced so the controller is never left with
-  // undelivered events; nothing else is submitted.
+  // undelivered events; nothing else is submitted until a rescan request.
   if (g_event_fault) { Fail(kErrEventStatus, g_event_fault_status); return; }
+  if (InterlockedExchange(&g_scan_request, 0) &&
+      g_scanner.Rescan(GetTickCount())) {
+    g_events.Clear();
+    g_assembler.Reset();
+    Log("bt-inquiry rescan requested");
+    SetPhase(kPhaseScanning);
+    return;
+  }
   if (!g_event_pending) {
     MemoryBarrier();
     g_events.Clear();
@@ -473,6 +493,58 @@ void RearmTick() {
   Log("bt-adapter removed");
 }
 
+DWORD UiStatus() {
+  switch (g_phase) {
+    case kPhaseConfigHeader:
+    case kPhaseConfig:
+      return kBluetoothStarting;
+    case kPhaseScanning:
+      return g_scanner.stage() >= bt::kStageInquiry ? kBluetoothScanning
+                                                    : kBluetoothStarting;
+    case kPhaseFinished: return kBluetoothReady;
+    case kPhaseFailed: return kBluetoothError;
+    default: return kBluetoothNoAdapter;
+  }
+}
+
+void PublishUi(bool force) {
+  DWORD now = GetTickCount();
+  if (!force && now - g_ui_published_at < 100) return;
+  g_ui_published_at = now;
+  BluetoothUiState& n = g_ui_next;
+  memset(&n, 0, sizeof(n));
+  n.status = UiStatus();
+  n.error = UsbBtDiagnostic[kDiagError];
+  if (n.status != kBluetoothNoAdapter) {
+    const BYTE* local = g_scanner.local_address();
+    for (int i = 0; i < 6; ++i) if (local[i]) n.address_valid = TRUE;
+    if (n.address_valid) memcpy(n.address, local, 6);
+    n.manufacturer = g_manufacturer;
+  }
+  if (n.status == kBluetoothScanning || n.status == kBluetoothReady) {
+    unsigned count = g_scanner.device_count();
+    if (count > 16) count = 16;
+    n.device_count = count;
+    for (unsigned i = 0; i < count; ++i) {
+      const bt::Device& d = g_scanner.devices()[i];
+      BluetoothUiDevice& u = n.devices[i];
+      memcpy(u.address, d.address, 6);
+      u.class_of_device = d.class_of_device;
+      u.rssi = d.rssi;
+      u.has_rssi = d.has_rssi ? TRUE : FALSE;
+      memcpy(u.name, d.name, sizeof(u.name));
+      u.name[sizeof(u.name) - 1] = 0;
+    }
+  }
+  EnterCriticalSection(&g_ui_lock);
+  n.sequence = g_ui.sequence;
+  if (memcmp(&n, &g_ui, sizeof(n)) != 0) {
+    n.sequence = g_ui.sequence + 1;
+    memcpy(&g_ui, &n, sizeof(n));
+  }
+  LeaveCriticalSection(&g_ui_lock);
+}
+
 void Tick() {
   if (g_removed && g_phase != kPhaseRearm) {
     g_rearm_last_attempt = g_removed_at;
@@ -498,6 +570,7 @@ void Tick() {
     case kPhaseFailed:
       break;
   }
+  PublishUi(false);
 }
 
 }  // namespace
@@ -513,8 +586,29 @@ VOID BluetoothDeviceRemoved() {
   InterlockedExchange(&g_removed, 1);
 }
 
+BOOL BluetoothGetUiState(BluetoothUiState* state) {
+  if (!state || !g_ui_ready) return FALSE;
+  EnterCriticalSection(&g_ui_lock);
+  memcpy(state, &g_ui, sizeof(*state));
+  LeaveCriticalSection(&g_ui_lock);
+  return TRUE;
+}
+
+VOID BluetoothRequestScan() {
+  InterlockedExchange(&g_scan_request, 1);
+}
+
+BOOL BluetoothAdapterPresent() {
+  BluetoothUiState state;
+  return BluetoothGetUiState(&state) && state.status != kBluetoothNoAdapter;
+}
+
 DWORD WINAPI BluetoothWorker(void*) {
   UsbBtDiagnostic[kDiagMarker] = 0x55414254;
+  memset(&g_ui, 0, sizeof(g_ui));
+  InitializeCriticalSection(&g_ui_lock);
+  MemoryBarrier();
+  InterlockedExchange(&g_ui_ready, 1);
   for (;;) {
     Tick();
     Sleep(g_phase == kPhaseScanning || g_phase == kPhaseConfig ||

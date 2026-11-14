@@ -227,10 +227,10 @@ static void WriteEvent(FILE* file, const Event& event) {
           "vid=%04lx pid=%04lx usb=%04lx device=%04lx "
           "device_class=%02lx/%02lx/%02lx configurations=%lu "
           "interface=%lu alt=%lu class=%02lx/%02lx/%02lx endpoints=%lu "
-          "controller=%lu rejection=%lu(%s)\n",
+          "controller=%lu hcd_flags=0x%02lx rejection=%lu(%s)\n",
           event.tick, DecisionName(v[0]), v[1], v[2], v[3], v[4], v[5],
           v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14],
-          v[15], v[16], v[17], RejectionName(v[17]));
+          v[15], v[16], v[18], v[17], RejectionName(v[17]));
       break;
     case kEventConfiguration:
       WriteConfiguration(file, event);
@@ -360,7 +360,8 @@ void DiagnosticsObserveDevice(const UsbAudioDeviceObservation& o) {
     o.usb_version, o.device_version, o.device_class, o.device_subclass,
     o.device_protocol, o.configuration_count, o.interface_number,
     o.alternate_setting, o.interface_class, o.interface_subclass,
-    o.interface_protocol, o.endpoint_count, o.controller, o.rejection, 0, 0
+    o.interface_protocol, o.endpoint_count, o.controller, o.rejection,
+    o.controller_flags, 0
   };
   Queue(kEventDevice, values, kValueCount, 0, 0);
 }

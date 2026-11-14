@@ -292,6 +292,16 @@ void TestFullScan() {
   assert(r.named == 1 && !strcmp(s.devices()[1].name, "Pixel"));
   assert(s.stage() == kStageDone && r.completed == 1 && r.complete_count == 2);
   assert(r.failed == 0 && r.warnings == 0);
+
+  // A rescan skips controller setup and goes straight to Inquiry.
+  assert(s.Rescan(now));
+  assert(!s.Rescan(now));
+  assert(s.stage() == kStageInquiry && s.device_count() == 0);
+  assert(!memcmp(s.local_address(), kLocal, 6));
+  ExpectCommand(s, inquiry, sizeof(inquiry), now);
+  CommandStatus(s, kOpInquiry, 0, ++now);
+  Feed(s, complete, ++now);
+  assert(s.stage() == kStageDone && r.completed == 2 && r.complete_count == 0);
 }
 
 void TestCommandTimeout() {

@@ -110,7 +110,33 @@ Use a build without other changes. Check the DashLaunch plugin slot and the
 | 14 | unhandled/unexpected HCI events |
 | 15 | rejected event completions |
 
+## Guide page (stage 1b)
+
+While the adapter holds the device slot, the Media tab's USB Audio row turns
+into a **Bluetooth** row. Its first button opens Guide → Media → Bluetooth,
+which shows:
+
+- the adapter address
+- a "Paired devices" section (empty until stage 2)
+- up to six available devices from the last scan (name, or address if no
+  name came back, plus device kind)
+- **Scan for devices**, which starts another inquiry without resetting the
+  controller
+
+Selecting a device only shows a note for now: pairing is stage 2. The page
+reads a snapshot (`BluetoothGetUiState`) and never touches USB.
+
+## First hardware findings (COD, 2026-11-14)
+
+- Devices plugged in at boot are enumerated before DashLaunch loads the
+  plugin, so only a hot-plug reaches the add hook (boot re-enumeration only
+  covers the full-speed path).
+- HCD index 0/1 are EHCI (high speed, vtable 0x800DDF40) and 2/3 are OHCI
+  (full speed, ISR 0x800DD518). The add-hook check `hcd[0x96] & 2` selects
+  2/3. The CSR clone (bcdDevice 88.91) hot-plugged onto controller 1 (EHCI)
+  and was rejected as `not-full-speed-ohci`. Next step: try another port with
+  no hub in between, or put a USB 1.1 hub in front of it.
+
 ## Next
 
-Stage 1b adds a Guide page (adapter address, Scan, device list). Stage 2 adds
-Secure Simple Pairing, link keys in the ini, and connect/forget.
+Stage 2 adds Secure Simple Pairing, link keys in the ini, and connect/forget.

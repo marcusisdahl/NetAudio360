@@ -31,6 +31,7 @@ struct UsbAudioDeviceObservation {
   BYTE endpoint_count;
   BYTE controller;
   BYTE rejection;
+  BYTE controller_flags;  // HCD byte +0x96 (bit 1: full-speed OHCI path).
   LONG add_status;
   UsbAudioDeviceDecision decision;
 };

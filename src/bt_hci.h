@@ -223,6 +223,9 @@ class Scanner {
 
   explicit Scanner(ScanObserver* observer);
   void Start(unsigned now);
+  // After a finished scan: run another inquiry without resetting the
+  // controller. Keeps the local address; clears the device table.
+  bool Rescan(unsigned now);
   // If a command may be sent now, writes it and returns its length (else 0).
   // The caller must call CommandSent once the transfer was accepted.
   unsigned NextCommand(u8* out, unsigned capacity);

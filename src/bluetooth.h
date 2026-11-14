@@ -9,5 +9,35 @@
 VOID BluetoothDeviceAttached(void* handle);
 VOID BluetoothDeviceRemoved();
 
+// Snapshot for the Guide (any passive thread).
+enum BluetoothUiStatus {
+  kBluetoothNoAdapter = 0,
+  kBluetoothStarting = 1,   // Adapter claimed, controller setup running.
+  kBluetoothScanning = 2,   // Inquiry or name resolution in progress.
+  kBluetoothReady = 3,      // Last scan finished; device list is final.
+  kBluetoothError = 4       // Adapter stopped; replug to retry.
+};
+struct BluetoothUiDevice {
+  BYTE address[6];          // Little-endian, as on the wire.
+  DWORD class_of_device;
+  LONG rssi;
+  BOOL has_rssi;
+  char name[64];            // UTF-8; empty while unknown.
+};
+struct BluetoothUiState {
+  DWORD sequence;           // Changes whenever anything below changes.
+  DWORD status;             // BluetoothUiStatus.
+  BOOL address_valid;
+  BYTE address[6];
+  WORD manufacturer;
+  DWORD error;
+  DWORD device_count;
+  BluetoothUiDevice devices[16];
+};
+BOOL BluetoothGetUiState(BluetoothUiState* state);
+// Starts another inquiry once the current one has finished.
+VOID BluetoothRequestScan();
+BOOL BluetoothAdapterPresent();
+
 // Passive worker thread that owns all Bluetooth USB submissions.
 DWORD WINAPI BluetoothWorker(void*);

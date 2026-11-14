@@ -208,6 +208,17 @@ void Scanner::Start(unsigned now) {
   Advance(kStageReset, now);
 }
 
+bool Scanner::Rescan(unsigned now) {
+  if (stage_ != kStageDone) return false;
+  memset(devices_, 0, sizeof(devices_));
+  device_count_ = 0;
+  name_index_ = -1;
+  pending_opcode_ = 0;
+  if (!credits_) credits_ = 1;
+  Advance(kStageInquiry, now);
+  return true;
+}
+
 void Scanner::Advance(unsigned next, unsigned now) {
   stage_ = next;
   command_ready_ = true;

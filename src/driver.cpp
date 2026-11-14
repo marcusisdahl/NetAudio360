@@ -587,10 +587,12 @@ static void RecordDevice(DeviceHandle* handle, int status,
   UsbAudioDeviceObservation observation;
   memset(&observation, 0, sizeof(observation));
   if (device_descriptor) {
-    observation.vendor_id = device_descriptor->vendor_id;
-    observation.product_id = device_descriptor->product_id;
-    observation.usb_version = device_descriptor->usb_version;
-    observation.device_version = device_descriptor->device_version;
+    // USB descriptors are little-endian; the native WORD view is swapped.
+    const BYTE* d = (const BYTE*)device_descriptor;
+    observation.vendor_id = (WORD)(d[8] | (d[9] << 8));
+    observation.product_id = (WORD)(d[10] | (d[11] << 8));
+    observation.usb_version = (WORD)(d[2] | (d[3] << 8));
+    observation.device_version = (WORD)(d[12] | (d[13] << 8));
     observation.device_class = device_descriptor->device_class;
     observation.device_subclass = device_descriptor->device_subclass;
     observation.device_protocol = device_descriptor->device_protocol;
@@ -609,6 +611,10 @@ static void RecordDevice(DeviceHandle* handle, int status,
     observation.interface_protocol = 0xff;
   }
   observation.controller = handle ? (*((BYTE*)handle + 8) & 3) : 0xff;
+  if (handle) {
+    BYTE* hcd = ((BYTE**)kUsbHcdTable)[*((BYTE*)handle + 8) & 3];
+    observation.controller_flags = hcd ? hcd[0x96] : 0xff;
+  }
   observation.rejection = rejection;
   observation.add_status = status;
   observation.decision = decision;
