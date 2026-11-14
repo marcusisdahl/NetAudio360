@@ -969,12 +969,15 @@ void RefreshBluetooth(BluetoothScene* state, bool force) {
         _snwprintf_s(text, _countof(text), _TRUNCATE,
                      L"Searching for devices... %u found so far.", ui.device_count);
         break;
+      case kBluetoothIdle:
+        wcscpy_s(text, L"Put headphones in pairing mode, then select Pair new device.");
+        break;
       case kBluetoothReady:
         if (ui.device_count)
           _snwprintf_s(text, _countof(text), _TRUNCATE,
-              L"Found %u device(s). Select Scan to search again.", ui.device_count);
+              L"Found %u device(s). Select one to pair.", ui.device_count);
         else
-          wcscpy_s(text, L"No devices found. Put headphones in pairing mode, then select Scan.");
+          wcscpy_s(text, L"No devices found. Check the headphones are in pairing mode and try again.");
         break;
       case kBluetoothError:
         _snwprintf_s(text, _countof(text), _TRUNCATE,
@@ -984,7 +987,8 @@ void RefreshBluetooth(BluetoothScene* state, bool force) {
     }
   }
   g_xui.set_text(state->status_text, text);
-  SetBool(state->scan_button, L"Enabled", ui.status == kBluetoothReady);
+  SetBool(state->scan_button, L"Enabled",
+          ui.status == kBluetoothReady || ui.status == kBluetoothIdle);
 
   HXUIOBJ focus = g_xui.tree_focus(state->object);
   for (unsigned i = 0; i < kBluetoothButtons; ++i) {
@@ -1120,7 +1124,7 @@ HXUIOBJ CreateBluetoothPanel() {
     {XUI_CLASS_BUTTON, L"BtDevice3", 444, 241, 260, 28, L"", L"XuiButtonGuide", 12},
     {XUI_CLASS_BUTTON, L"BtDevice4", 444, 275, 260, 28, L"", L"XuiButtonGuide", 12},
     {XUI_CLASS_BUTTON, L"BtDevice5", 444, 309, 260, 28, L"", L"XuiButtonGuide", 12},
-    {XUI_CLASS_BUTTON, L"BtScanButton", 144, 352, 260, 28, L"Scan for devices", L"XuiButtonGuide", 12},
+    {XUI_CLASS_BUTTON, L"BtScanButton", 144, 352, 260, 28, L"Pair new device", L"XuiButtonGuide", 12},
     {XUI_CLASS_TEXT, L"BtStatus", 154, 230, 240, 100, L"", 0, 10},
     // Input-only B handler; the Guide shell supplies the visible Back legend.
     {XUI_CLASS_BUTTON, L"BtBackButton", 0, 0, 0, 0, 0, 0, 0},

@@ -452,7 +452,8 @@ void ConfigTick() {
   if (!QueueEvent()) return;
   Step("hci-scan");
   SetPhase(kPhaseScanning);
-  g_scanner.Start(GetTickCount());
+  // Setup only: the adapter never scans until the Guide asks for it.
+  g_scanner.Start(GetTickCount(), false);
 }
 
 void ScanTick() {
@@ -544,7 +545,8 @@ DWORD UiStatus() {
     case kPhaseScanning:
       return g_scanner.stage() >= bt::kStageInquiry ? kBluetoothScanning
                                                     : kBluetoothStarting;
-    case kPhaseFinished: return kBluetoothReady;
+    case kPhaseFinished:
+      return g_scanner.inquiries() ? kBluetoothReady : kBluetoothIdle;
     case kPhaseFailed: return kBluetoothError;
     default: return kBluetoothNoAdapter;
   }
@@ -565,6 +567,7 @@ void PublishUi(bool force) {
     n.manufacturer = g_manufacturer;
   }
   if (n.status == kBluetoothScanning || n.status == kBluetoothReady) {
+    // kBluetoothIdle has no list: nothing has been searched yet.
     unsigned count = g_scanner.device_count();
     if (count > 16) count = 16;
     n.device_count = count;

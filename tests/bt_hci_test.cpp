@@ -85,9 +85,9 @@ const u8 kPhone[6] = {0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6};
 const u8 kLocal[6] = {0x01, 0x02, 0x03, 0x7D, 0x1A, 0x00};
 
 // Drives Reset .. Write_Inquiry_Mode to the start of Inquiry.
-void RunSetup(Scanner& s, Recorder& r, unsigned* now) {
+void RunSetup(Scanner& s, Recorder& r, unsigned* now, bool inquire = true) {
   const u8 ok[] = {0};
-  s.Start(*now);
+  s.Start(*now, inquire);
   assert(s.stage() == kStageReset);
   const u8 reset[] = {0x03, 0x0C, 0x00};
   ExpectCommand(s, reset, 3, *now);
@@ -114,7 +114,7 @@ void RunSetup(Scanner& s, Recorder& r, unsigned* now) {
   const u8 mode[] = {0x45, 0x0C, 0x01, 0x02};
   ExpectCommand(s, mode, sizeof(mode), *now);
   CommandComplete(s, kOpWriteInquiryMode, ok, 1, ++*now);
-  assert(s.stage() == kStageInquiry);
+  assert(s.stage() == (inquire ? kStageInquiry : kStageDone));
 }
 
 void TestDescriptors() {
@@ -304,6 +304,23 @@ void TestFullScan() {
   assert(s.stage() == kStageDone && r.completed == 2 && r.complete_count == 0);
 }
 
+void TestSetupWithoutInquiry() {
+  Recorder r;
+  Scanner s(&r);
+  unsigned now = 100;
+  RunSetup(s, r, &now, false);
+  // Controller configured, but no Inquiry until the Guide asks for one.
+  assert(s.stage() == kStageDone && s.inquiries() == 0);
+  u8 out[64];
+  assert(s.NextCommand(out, sizeof(out)) == 0);
+  s.Tick(now + 60000);
+  assert(s.stage() == kStageDone && r.failed == 0 && r.completed == 0);
+  assert(s.Rescan(now));
+  assert(s.stage() == kStageInquiry && s.inquiries() == 1);
+  const u8 inquiry[] = {0x01, 0x04, 0x05, 0x33, 0x8B, 0x9E, 0x08, 0x00};
+  ExpectCommand(s, inquiry, sizeof(inquiry), now);
+}
+
 void TestCommandTimeout() {
   Recorder r;
   Scanner s(&r);
@@ -442,6 +459,7 @@ int main() {
   TestAssembler();
   TestNames();
   TestFullScan();
+  TestSetupWithoutInquiry();
   TestCommandTimeout();
   TestResetRejectedAndHardwareError();
   TestInquiryModeFallbackAndFailures();

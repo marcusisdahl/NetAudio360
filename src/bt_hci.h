@@ -222,7 +222,9 @@ class Scanner {
   static const u8 kInquiryLength = 8;  // x 1.28 s = 10.24 s.
 
   explicit Scanner(ScanObserver* observer);
-  void Start(unsigned now);
+  // Resets and configures the controller. With inquire false it stops in
+  // kStageDone without scanning, and the first scan waits for Rescan.
+  void Start(unsigned now, bool inquire = true);
   // After a finished scan: run another inquiry without resetting the
   // controller. Keeps the local address; clears the device table.
   bool Rescan(unsigned now);
@@ -236,6 +238,7 @@ class Scanner {
   void Tick(unsigned now);
 
   unsigned stage() const { return stage_; }
+  unsigned inquiries() const { return inquiries_; }
   bool finished() const { return stage_ == kStageDone || stage_ == kStageFailed; }
   const u8* local_address() const { return local_address_; }
   const Device* devices() const { return devices_; }
@@ -260,6 +263,8 @@ class Scanner {
   u16 built_opcode_;     // Last command returned by NextCommand.
   bool command_ready_;   // A command for the current stage is unsent.
   u8 inquiry_mode_;      // Requested mode; falls back on rejection.
+  bool inquire_on_start_;
+  unsigned inquiries_;   // Inquiries started since Start.
   unsigned deadline_;
   bool deadline_armed_;
   int name_index_;       // Device awaiting Remote Name Request Complete.

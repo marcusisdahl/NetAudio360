@@ -191,6 +191,8 @@ Scanner::Scanner(ScanObserver* observer) : observer_(observer) {
   built_opcode_ = 0;
   command_ready_ = false;
   inquiry_mode_ = 2;
+  inquire_on_start_ = true;
+  inquiries_ = 0;
   deadline_ = 0;
   deadline_armed_ = false;
   name_index_ = -1;
@@ -201,9 +203,10 @@ Scanner::Scanner(ScanObserver* observer) : observer_(observer) {
   unhandled_events_ = 0;
 }
 
-void Scanner::Start(unsigned now) {
+void Scanner::Start(unsigned now, bool inquire) {
   ScanObserver* observer = observer_;
   *this = Scanner(observer);
+  inquire_on_start_ = inquire;
   credits_ = 1;  // A controller accepts one command after power-on/reset.
   Advance(kStageReset, now);
 }
@@ -220,6 +223,7 @@ bool Scanner::Rescan(unsigned now) {
 }
 
 void Scanner::Advance(unsigned next, unsigned now) {
+  if (next == kStageInquiry) ++inquiries_;
   stage_ = next;
   command_ready_ = true;
   name_wait_ = false;
@@ -387,6 +391,12 @@ bool Scanner::OnCommandComplete(const u8* p, unsigned n, unsigned now) {
           break;
         }
         // Fall through to inquiry using the controller's default mode.
+      }
+      if (!inquire_on_start_) {
+        stage_ = kStageDone;  // Controller ready; scanning waits for Rescan.
+        deadline_armed_ = false;
+        command_ready_ = false;
+        break;
       }
       Advance(kStageInquiry, now);
       break;

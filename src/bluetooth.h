@@ -15,7 +15,8 @@ enum BluetoothUiStatus {
   kBluetoothStarting = 1,   // Adapter claimed, controller setup running.
   kBluetoothScanning = 2,   // Inquiry or name resolution in progress.
   kBluetoothReady = 3,      // Last scan finished; device list is final.
-  kBluetoothError = 4       // Adapter stopped; replug to retry.
+  kBluetoothError = 4,      // Adapter stopped; replug to retry.
+  kBluetoothIdle = 5        // Adapter ready; no search run yet.
 };
 struct BluetoothUiDevice {
   BYTE address[6];          // Little-endian, as on the wire.
@@ -35,7 +36,8 @@ struct BluetoothUiState {
   BluetoothUiDevice devices[16];
 };
 BOOL BluetoothGetUiState(BluetoothUiState* state);
-// Starts another inquiry once the current one has finished.
+// Starts a ~10 s search ("Pair new device"); the adapter never scans
+// otherwise. Ignored while setup or another search is running.
 VOID BluetoothRequestScan();
 BOOL BluetoothAdapterPresent();
 
