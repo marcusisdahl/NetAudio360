@@ -2010,6 +2010,7 @@ UINT AudioReadBluetoothPcm(SHORT* out, UINT frames) {
   if (g_io_handle || !out) return 0;
   LONG read = g_pcm_read;
   LONG write = g_pcm_write;
+  MemoryBarrier();  // Read the samples only after seeing the write index.
   LONG available = write - read;
   if (available <= 0) return 0;
   if ((UINT)available < frames) frames = (UINT)available;

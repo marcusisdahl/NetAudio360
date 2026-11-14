@@ -407,8 +407,9 @@ const unsigned kAclOutSlots = 3;
 const unsigned kAclOutBytes = 1104;  // HCI ACL header + one L2CAP fragment.
 const DWORD kToneMs = 2000;          // 375 Hz test tone before the system mix.
 const DWORD kStreamLeadMs = 60;      // Send this far ahead of real time.
-const UINT kPcmCushion = 1536;       // Captured frames kept as jitter cushion.
+const UINT kPcmCushion = 512;        // Captured frames kept as jitter cushion.
 const UINT kPcmCeiling = 3072;       // Above this, drop back to the cushion.
+const DWORD kCaptureStallMs = 100;   // No capture this long: send silence.
 
 enum A2dpDiagIndex {
   kA2Marker = 0,          // 0x55414144 'UAAD'
@@ -426,12 +427,13 @@ enum A2dpDiagIndex {
   kA2OpenOut = 12,
   kA2SbcFrames = 13,
   kA2AclMtu = 14,
-  kA2AclBuffers = 15
+  kA2AclBuffers = 15,
+  kA2Trims = 16           // Times the ring was trimmed after a stall.
 };
 
 }  // namespace
 // Live A2DP counters for XBDM inspection; see A2dpDiagIndex.
-extern "C" volatile DWORD UsbBtA2dp[16] = {0};
+extern "C" volatile DWORD UsbBtA2dp[20] = {0};
 namespace {
 
 static UsbControlTrb g_acl_in_trb;
@@ -455,7 +457,7 @@ static bt::SbcEncoder g_sbc;
 static bool g_sbc_ready = false;
 static bool g_a2dp_started = false;
 static bool g_tone_played = false;
-static bool g_pcm_primed = false;
+static DWORD g_last_audio = 0;
 static DWORD g_stream_start = 0;
 static DWORD g_samples_sent = 0;
 static DWORD g_rtp_timestamp = 0;
@@ -473,7 +475,7 @@ static unsigned g_a2dp_unhandled_logged = 0;
 void StreamBegin() {
   g_stream_start = GetTickCount();
   g_samples_sent = 0;
-  g_pcm_primed = false;
+  g_last_audio = g_stream_start;
   g_sbc.Reset();
 }
 
@@ -602,7 +604,7 @@ void OpenAcl(const bt::HciEndpoints& e) {
   for (unsigned i = 0; i < kAclOutSlots; ++i)
     InterlockedExchange(&g_acl_out_pending[i], 0);
   UsbBtA2dp[kA2Marker] = 0x55414144;
-  for (int i = 1; i < 16; ++i) UsbBtA2dp[i] = 0;
+  for (int i = 1; i < 20; ++i) UsbBtA2dp[i] = 0;
   if (!e.acl_in_address || !e.acl_out_address || !e.acl_in_max_packet ||
       !e.acl_out_max_packet) {
     Log("bt-acl no bulk endpoints; audio disabled");
@@ -743,40 +745,36 @@ void AclTransmit() {
   }
 }
 
-// One SBC frame of PCM: the test tone first, then the captured system mix.
-void FillPcm(DWORD now) {
+// One SBC frame of the test tone.
+void FillTone() {
   const unsigned spf = g_sbc.samples_per_frame();
-  if (!g_tone_played && now - g_stream_start < kToneMs) {
-    for (unsigned i = 0; i < spf; ++i)
-      g_pcm_frame[2 * i] = g_pcm_frame[2 * i + 1] = g_tone[i & 127];
-    return;
-  }
-  if (!g_tone_played) {
-    g_tone_played = true;
-    g_pcm_primed = false;
-    AudioDiscardBluetoothPcm();  // The ring holds stale audio from before.
-    Log("bt-a2dp test tone done; streaming console audio");
-  }
-  UINT available = AudioBluetoothPcmAvailable();
-  if (!g_pcm_primed) {
-    if (available < kPcmCushion) {
-      memset(g_pcm_frame, 0, spf * 4);
-      return;
-    }
-    g_pcm_primed = true;
-  }
-  while (available > kPcmCeiling) {
-    UINT drop = available - kPcmCushion;
-    if (drop > 128) drop = 128;
-    AudioReadBluetoothPcm(g_pcm_scratch, drop);
-    available = AudioBluetoothPcmAvailable();
-  }
+  for (unsigned i = 0; i < spf; ++i)
+    g_pcm_frame[2 * i] = g_pcm_frame[2 * i + 1] = g_tone[i & 127];
+}
+
+// One SBC frame from the captured mix (the caller checked availability).
+void FillFromRing() {
+  const unsigned spf = g_sbc.samples_per_frame();
   UINT got = AudioReadBluetoothPcm(g_pcm_frame, spf);
   if (got < spf) {
     memset(g_pcm_frame + 2 * got, 0, (spf - got) * 4);
     UsbBtA2dp[kA2SilentFrames] += spf - got;
-    if (!got) g_pcm_primed = false;  // Rebuild the cushion after a gap.
   }
+}
+
+bool SendPacket(unsigned per, int source) {  // 0 tone, 1 ring, 2 silence
+  unsigned bytes = 0;
+  for (unsigned f = 0; f < per; ++f) {
+    if (source == 0) FillTone();
+    else if (source == 1) FillFromRing();
+    else memset(g_pcm_frame, 0, sizeof(g_pcm_frame));
+    bytes += g_sbc.Encode(g_pcm_frame, g_media + bytes);
+  }
+  UsbBtA2dp[kA2SbcFrames] += per;
+  bool sent = g_a2dp.SendMedia(g_media, bytes, per, g_rtp_timestamp);
+  if (sent) ++UsbBtA2dp[kA2MediaPackets];
+  g_rtp_timestamp += per * g_sbc.samples_per_frame();
+  return sent;
 }
 
 void StreamAudio(DWORD now) {
@@ -793,25 +791,54 @@ void StreamAudio(DWORD now) {
   if (budget < 13 + frame) return;
   unsigned per = (budget - 13) / frame;
   if (per > 15) per = 15;
-  DWORD target = (now - g_stream_start + kStreamLeadMs) * 48;
-  if ((LONG)(target - g_samples_sent) > 48 * 300) {
-    // Stalled (flow control or a slow tick): skip ahead instead of bursting.
-    DWORD skip = target - g_samples_sent - 48 * kStreamLeadMs;
-    g_samples_sent += skip;
-    g_rtp_timestamp += skip;
-  }
-  while ((LONG)(target - g_samples_sent) >= (LONG)(per * spf)) {
-    if (g_a2dp.free_slots() < 3) return;  // Keep room for signalling.
-    unsigned bytes = 0;
-    for (unsigned f = 0; f < per; ++f) {
-      FillPcm(now);
-      bytes += g_sbc.Encode(g_pcm_frame, g_media + bytes);
+  const unsigned need = per * spf;
+
+  if (!g_tone_played && now - g_stream_start < kToneMs) {
+    // Test tone: paced by the tick clock, slightly ahead of real time.
+    DWORD target = (now - g_stream_start + kStreamLeadMs) * 48;
+    while ((LONG)(target - g_samples_sent) >= (LONG)need) {
+      if (g_a2dp.free_slots() < 3) return;
+      SendPacket(per, 0);
+      g_samples_sent += need;
     }
-    UsbBtA2dp[kA2SbcFrames] += per;
-    if (g_a2dp.SendMedia(g_media, bytes, per, g_rtp_timestamp))
-      ++UsbBtA2dp[kA2MediaPackets];
-    g_rtp_timestamp += per * spf;
-    g_samples_sent += per * spf;
+    return;
+  }
+  if (!g_tone_played) {
+    g_tone_played = true;
+    g_last_audio = now;
+    AudioDiscardBluetoothPcm();  // The ring holds stale audio from before.
+    Log("bt-a2dp test tone done; streaming console audio");
+  }
+  // Console audio is paced by the capture itself: a packet goes out whenever
+  // the ring holds one packet beyond a small cushion. The headphones follow
+  // the console's audio clock, so nothing is dropped or repeated here.
+  for (;;) {
+    if (g_a2dp.free_slots() < 3) return;  // Keep room for signalling.
+    UINT available = AudioBluetoothPcmAvailable();
+    if (available > kPcmCeiling) {
+      // We fell behind (a stall on our side): drop old audio, keep latency.
+      while (available > kPcmCushion + need) {
+        UINT drop = available - (kPcmCushion + need);
+        if (drop > 128) drop = 128;
+        AudioReadBluetoothPcm(g_pcm_scratch, drop);
+        available = AudioBluetoothPcmAvailable();
+      }
+      ++UsbBtA2dp[kA2Trims];
+    }
+    if (available >= kPcmCushion + need) {
+      SendPacket(per, 1);
+      g_last_audio = now;
+      continue;
+    }
+    // No capture (a USB DAC owns the mix, or the console stopped rendering):
+    // keep the stream alive with silence at real-time rate.
+    if (now - g_last_audio >= kCaptureStallMs + need / 48) {
+      SendPacket(per, 2);
+      UsbBtA2dp[kA2SilentFrames] += need;
+      g_last_audio = now - kCaptureStallMs;
+      continue;
+    }
+    return;
   }
 }
 

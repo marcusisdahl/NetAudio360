@@ -882,7 +882,9 @@ extern "C" BOOL APIENTRY DllMain(HANDLE module, DWORD reason, LPVOID) {
   StartWorker((LPTHREAD_START_ROUTINE)NotificationWorker,
               THREAD_PRIORITY_BELOW_NORMAL, true);
 #if USB_AUDIO360_BLUETOOTH
-  StartWorker(BluetoothWorker, THREAD_PRIORITY_NORMAL, false);
+  // Above normal like the audio worker: A2DP packets must keep flowing while
+  // the dashboard is busy (normal priority stuttered in Aurora).
+  StartWorker(BluetoothWorker, THREAD_PRIORITY_ABOVE_NORMAL, false);
 #endif
   RemoteVolumeInitialize(kernel);
   return TRUE;

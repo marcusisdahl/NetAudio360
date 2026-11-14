@@ -263,21 +263,21 @@ bool DacConnected() {
 }
 
 // The single device slot holds either a DAC or a Bluetooth adapter, so the
-// one Media row switches role. In Bluetooth mode the first button opens the
-// Bluetooth page and the audio-only buttons are hidden.
+// one Media row switches role. In Bluetooth mode the volume button still
+// controls the output volume (it applies to the Bluetooth stream too), the
+// microphone button is hidden, and the options cell opens the Bluetooth page.
 void SetRowMode(VolumeScene* state, bool bluetooth) {
   if (state->expanded) SetExpanded(state, false, XUSER_INDEX_FOCUS, false);
-  // The lone Bluetooth button takes the row's rightmost cell (the options
-  // slot), so it lines up with the end of the other Media rows.
-  D3DXVECTOR3 position(bluetooth ? 265.0f : 161.0f, 0, 0);
+  D3DXVECTOR3 position(161.0f, 0, 0);
   bool ok = g_xui.set_position(state->volume_button, &position) >= 0 &&
       SetString(state->title, L"Text", bluetooth ? L"Bluetooth" : L"USB Audio") &&
-      SetString(state->volume_button, L"ImagePath",
-                bluetooth ? g_options_icon : g_volume_icon) &&
+      SetString(state->volume_button, L"ImagePath", g_volume_icon) &&
       SetBool(state->microphone_button, L"Show", !bluetooth) &&
-      SetBool(state->options_button, L"Show", !bluetooth) &&
+      SetBool(state->options_button, L"Show", TRUE) &&
       SetString(state->volume_button, L"NavRight",
-                bluetooth ? L"" : L"MicrophoneMuteButton");
+                bluetooth ? L"OptionsButton" : L"MicrophoneMuteButton") &&
+      SetString(state->options_button, L"NavLeft",
+                bluetooth ? L"VolumeButton" : L"MicrophoneMuteButton");
   if (ok) state->bluetooth = bluetooth;
 }
 
@@ -306,10 +306,11 @@ void RefreshRowVisibility(VolumeScene* state) {
 }
 
 void Synchronize(VolumeScene* state) {
-  if (!state || !state->slider || state->synchronizing || state->bluetooth) return;
+  if (!state || !state->slider || state->synchronizing) return;
   state->synchronizing = true;
   LONG volume = AudioGetVolume();
   g_xui.set_slider(state->slider, volume);
+  if (state->bluetooth) { state->synchronizing = false; return; }
   SetString(state->microphone_button, L"ImagePath",
             AudioIsMicrophoneMuted()
                 ? g_microphone_muted_icon : g_microphone_icon);
@@ -641,15 +642,15 @@ HRESULT APIENTRY VolumeObjectProc(HXUIOBJ object, XUIMessage* message, void* ins
       message->bHandled = TRUE;
     } else if (notify->dwNotify == XN_PRESS) {
       BYTE user = PressUser(notify);
-      if (source == state->volume_button && state->bluetooth)
-        OpenBluetooth(state, user);
-      else if (source == state->volume_button)
+      if (source == state->volume_button)
         SetExpanded(state, !state->expanded, user);
       else if (source == state->dismiss_button || source == state->confirm_button)
         SetExpanded(state, false, user);
       else if (source == state->microphone_button && AudioMicrophoneAvailable()) {
         AudioSetMicrophoneMuted(!AudioIsMicrophoneMuted());
         Synchronize(state);
+      } else if (source == state->options_button && state->bluetooth) {
+        OpenBluetooth(state, user);
       } else if (source == state->options_button) {
         OpenSettings(state, user);
       }
@@ -715,13 +716,14 @@ bool SetExpanded(VolumeScene* state, bool expanded, BYTE user, bool restore_focu
   if (!state || !state->volume_button || !state->slider) return false;
   D3DXVECTOR3 position(expanded ? 109.0f : 161.0f, 0, 0);
   bool ok = g_xui.set_position(state->volume_button, &position) >= 0 &&
-      SetBool(state->microphone_button, L"Show", !expanded) &&
+      SetBool(state->microphone_button, L"Show", !expanded && !state->bluetooth) &&
       SetBool(state->options_button, L"Show", !expanded) &&
       SetBool(state->slider, L"Show", expanded) &&
       SetBool(state->dismiss_button, L"Enabled", expanded) &&
       SetBool(state->confirm_button, L"Enabled", expanded) &&
       SetString(state->volume_button, L"NavRight",
-                expanded ? L"VolumeSlider" : L"MicrophoneMuteButton");
+                expanded ? L"VolumeSlider"
+                         : state->bluetooth ? L"OptionsButton" : L"MicrophoneMuteButton");
   if (!ok) return false;
   state->expanded = expanded;
   Synchronize(state);
