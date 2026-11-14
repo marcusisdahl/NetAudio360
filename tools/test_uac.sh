@@ -133,6 +133,13 @@ rm -f "$test_dir/bt_link_tests"
   -fsanitize=address,undefined -fno-omit-frame-pointer -g \
   -I"$project_root/src" "$project_root/src/bt_hci.cpp" \
   "$project_root/src/bt_sbc.cpp" "$project_root/src/bt_a2dp.cpp" \
+  "$project_root/src/bt_sdp.cpp" \
   "$project_root/tests/bt_a2dp_test.cpp" -o "$test_dir/bt_a2dp_tests"
 "$test_dir/bt_a2dp_tests"
 rm -f "$test_dir/bt_a2dp_tests"
+"$compiler" -std=c++98 -Wall -Wextra -Werror -pedantic \
+  -fsanitize=address,undefined -fno-omit-frame-pointer -g \
+  -I"$project_root/src" "$project_root/src/bt_sdp.cpp" \
+  "$project_root/tests/bt_sdp_test.cpp" -o "$test_dir/bt_sdp_tests"
+"$test_dir/bt_sdp_tests"
+rm -f "$test_dir/bt_sdp_tests"

@@ -28,7 +28,7 @@ $env:TMP = "$build\tmp"; $env:TEMP = "$build\tmp"
 
 $sources = 'driver', 'audio', 'settings', 'settings_ini', 'guide_ui', 'remote_volume',
            'diagnostics', 'xbox_usb_transport', 'uac_descriptors', 'uac_clock', 'detour',
-           'bluetooth', 'bt_hci', 'bt_link', 'bt_sbc', 'bt_a2dp'
+           'bluetooth', 'bt_hci', 'bt_link', 'bt_sbc', 'bt_a2dp', 'bt_sdp'
 
 foreach ($s in $sources) {
   & "$Xdk\bin\win32\cl.exe" /nologo /c /O2 /GS- /D_XBOX /DNDEBUG "/DUSB_AUDIO360_DEBUG_API=$debugFlag" `

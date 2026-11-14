@@ -79,6 +79,7 @@ class A2dpSource {
   static const u16 kOurMtu = 1000;
   static const u16 kSignalCid = 0x0040;
   static const u16 kMediaCid = 0x0041;
+  static const u16 kSdpCid = 0x0042;  // Headphones query our SDP record.
   static const u8 kOurSeid = 1;
 
   explicit A2dpSource(A2dpObserver* observer);
@@ -104,6 +105,7 @@ class A2dpSource {
                  u32 timestamp);
   unsigned free_slots() const { return kQueue - out_count_; }
   unsigned unhandled() const { return unhandled_; }
+  unsigned sdp_requests() const { return sdp_requests_; }
 
  private:
   static const unsigned kQueue = 8;
@@ -130,6 +132,8 @@ class A2dpSource {
   bool ChooseConfig(const u8* codec, unsigned n);
   void ChannelReady(unsigned now);
   void WriteOurCapabilities(u8* out, unsigned* n) const;
+  Channel* ChannelFor(u16 local_cid);
+  void OnSdp(const u8* p, unsigned n);
 
   A2dpObserver* observer_;
   unsigned state_;
@@ -139,8 +143,9 @@ class A2dpSource {
   u8 next_label_;
   u8 pending_label_;
   u8 pending_signal_;
-  Channel signal_, media_;
-  u16 remote_signal_mtu_, remote_media_mtu_;
+  Channel signal_, media_, sdp_;
+  u16 remote_signal_mtu_, remote_media_mtu_, remote_sdp_mtu_;
+  unsigned sdp_requests_;
   // Sink endpoints from DISCOVER.
   u8 sinks_[8];
   unsigned sink_count_, sink_index_;

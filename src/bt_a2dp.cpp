@@ -3,6 +3,8 @@
 
 #include <string.h>
 
+#include "bt_sdp.h"
+
 namespace bt {
 
 namespace {
@@ -24,6 +26,7 @@ enum {
 };
 const u16 kSignalingCid = 0x0001;
 const u16 kPsmAvdtp = 0x0019;
+const u16 kPsmSdp = 0x0001;
 
 // AVDTP signals and message types (AVDTP 8.4-8.5).
 enum {
@@ -123,8 +126,11 @@ void A2dpSource::Reset() {
   pending_signal_ = 0;
   memset(&signal_, 0, sizeof(signal_));
   memset(&media_, 0, sizeof(media_));
+  memset(&sdp_, 0, sizeof(sdp_));
   remote_signal_mtu_ = 672;
   remote_media_mtu_ = 672;
+  remote_sdp_mtu_ = 672;
+  sdp_requests_ = 0;
   sink_count_ = sink_index_ = 0;
   acp_seid_ = 0;
   memset(sbc_caps_, 0, sizeof(sbc_caps_));
@@ -266,6 +272,8 @@ void A2dpSource::OnFrame(const u8* frame, unsigned length, unsigned now) {
     }
   } else if (cid == kSignalCid && signal_.connected) {
     OnAvdtp(p, n, now);
+  } else if (cid == kSdpCid && sdp_.connected) {
+    OnSdp(p, n);
   } else {
     // Media channel input (none expected for a source) or unknown CID.
     if (cid != kMediaCid) ++unhandled_;
@@ -286,6 +294,9 @@ void A2dpSource::OnSignal(const u8* p, unsigned n, unsigned now) {
       if (psm == kPsmAvdtp && !signal_.connected && !signal_.open_requested) {
         c = &signal_; local = kSignalCid;   // Headphones opened signalling.
         if (state_ == kA2dpIdle) SetState(kA2dpSignalConnect, now);
+      } else if (psm == kPsmSdp && !sdp_.connected) {
+        c = &sdp_; local = kSdpCid;  // Headphones look up our A2DP record.
+        remote_sdp_mtu_ = 672;
       } else if (psm == kPsmAvdtp && signal_.connected && !media_.connected &&
                  !media_.open_requested && state_ == kA2dpMediaConnect) {
         c = &media_; local = kMediaCid;
@@ -305,7 +316,7 @@ void A2dpSource::OnSignal(const u8* p, unsigned n, unsigned now) {
     case kConnectionResponse: {
       if (len < 8) break;
       u16 dcid = Le16(d), scid = Le16(d + 2), result = Le16(d + 4);
-      Channel* c = scid == kSignalCid ? &signal_ : scid == kMediaCid ? &media_ : 0;
+      Channel* c = ChannelFor(scid);
       if (!c || !c->open_requested || c->connected) { ++unhandled_; break; }
       if (result == 0x0001) break;  // Pending: wait for the final response.
       if (result != 0) { Fail(kA2dpFailL2cap, result); break; }
@@ -317,7 +328,7 @@ void A2dpSource::OnSignal(const u8* p, unsigned n, unsigned now) {
     case kConfigureRequest: {
       if (len < 4) break;
       u16 dcid = Le16(d);
-      Channel* c = dcid == kSignalCid ? &signal_ : dcid == kMediaCid ? &media_ : 0;
+      Channel* c = ChannelFor(dcid);
       u8 r[6];
       if (!c || !c->connected) {
         // Invalid CID: Command Reject, reason 0x0002 with the CIDs.
@@ -335,6 +346,7 @@ void A2dpSource::OnSignal(const u8* p, unsigned n, unsigned now) {
         if (type == 0x01 && olen >= 2) {
           u16 mtu = Le16(d + at + 2);
           if (c == &signal_) remote_signal_mtu_ = mtu;
+          else if (c == &sdp_) remote_sdp_mtu_ = mtu;
           else remote_media_mtu_ = mtu;
         }
         at += 2 + olen;
@@ -350,7 +362,7 @@ void A2dpSource::OnSignal(const u8* p, unsigned n, unsigned now) {
     case kConfigureResponse: {
       if (len < 6) break;
       u16 scid = Le16(d), result = Le16(d + 4);
-      Channel* c = scid == kSignalCid ? &signal_ : scid == kMediaCid ? &media_ : 0;
+      Channel* c = ChannelFor(scid);
       if (!c) { ++unhandled_; break; }
       if (result == 0x0004) break;  // Pending.
       if (result != 0) { Fail(kA2dpFailL2cap, 0x100 | result); break; }
@@ -365,6 +377,10 @@ void A2dpSource::OnSignal(const u8* p, unsigned n, unsigned now) {
       Put16(r, dcid);
       Put16(r + 2, scid);
       SendSignal(kDisconnectionResponse, id, r, sizeof(r));
+      if (dcid == kSdpCid) {  // Query done; not part of the stream.
+        memset(&sdp_, 0, sizeof(sdp_));
+        break;
+      }
       if (dcid == kSignalCid || dcid == kMediaCid) {
         Channel& c = dcid == kSignalCid ? signal_ : media_;
         memset(&c, 0, sizeof(c));
@@ -407,6 +423,25 @@ void A2dpSource::OnSignal(const u8* p, unsigned n, unsigned now) {
       break;
     }
   }
+}
+
+A2dpSource::Channel* A2dpSource::ChannelFor(u16 local_cid) {
+  if (local_cid == kSignalCid) return &signal_;
+  if (local_cid == kMediaCid) return &media_;
+  if (local_cid == kSdpCid) return &sdp_;
+  return 0;
+}
+
+void A2dpSource::OnSdp(const u8* p, unsigned n) {
+  ++sdp_requests_;
+  unsigned capacity = remote_sdp_mtu_;
+  if (capacity > kSlotBytes - 4) capacity = kSlotBytes - 4;
+  u8* out = Begin(sdp_.remote_cid, capacity);
+  if (!out) { Fail(kA2dpFailQueue, 0x5D); return; }
+  unsigned length = SdpHandle(p, n, out, capacity);
+  if (!length) return;  // Nothing committed; the slot stays free.
+  Put16(out - 4, length);
+  Commit(length);
 }
 
 void A2dpSource::WriteOurCapabilities(u8* out, unsigned* n) const {

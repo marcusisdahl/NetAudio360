@@ -43,3 +43,13 @@ open status, 13 SBC frames, 14/15 ACL MTU/buffers.
 
 Log lines: `bt-acl ...`, `bt-a2dp <state>`, `bt-a2dp sbc ...`,
 `bt-a2dp failed reason=... detail=...`.
+
+## SDP
+
+The first hardware run showed the Bose opening an SDP channel (PSM 1) to the
+console right after our AVDTP channel came up, and ignoring AVDTP DISCOVER
+once we refused it. `A2dpSource` now accepts SDP on local CID 0x0042 and
+answers with `bt::SdpHandle` (src/bt_sdp.cpp): one A2DP Source record
+(handle 0x00010001; AudioSource 0x110A, L2CAP PSM 0x19 + AVDTP 1.3, A2DP 1.3,
+features Player), supporting ServiceSearch, ServiceAttribute and
+ServiceSearchAttribute with continuation.
